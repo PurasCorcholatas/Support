@@ -15,8 +15,7 @@ whatssap_router = APIRouter()
 
 CHATWOOT_URL = os.getenv("CHATWOOT_URL")
 ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID")
-API_TOKEN = os.getenv("CHAT_API_TOKEN")
-
+API_TOKEN = os.getenv("CHATWOOT_API_TOKEN")
 
 
 
@@ -57,22 +56,27 @@ def chat_endopoint( payload: ChatRequest):
     answer = messages[-1].content if messages else "No se puedo generar la respuesta"
     return {"answer": answer}
 
-from fastapi import Request
 
 
 @whatssap_router.post("/whatsapp/webhook")
 async def chat_webhook(request: Request):
 
     data = await request.json()
+    print(" DATA RECIBIDA:", data)
 
-    if data["event"] != "message_created":
+    
+    if data.get("event") != "message_created":
         return {"status": "ignored"}
 
-    if data["message"]["message_type"] != "incoming":
-        return {"status": "ignored"}
+    
+    if data.get("message_type") != "incoming":
+        return {"status": "not incoming"}
 
-    message = data["message"]["content"]
-    conversation_id = data["conversation"]["id"]
+    message = data.get("content")
+    conversation_id = data.get("conversation", {}).get("id")
+
+    if not message or not conversation_id:
+        return {"status": "missing data"}
 
     respuesta = langgraph(message, str(conversation_id))
 
@@ -88,7 +92,9 @@ async def chat_webhook(request: Request):
         "message_type": "outgoing"
     }
 
-    requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers)
+
+    print("STATUS CHATWOOT:", response.status_code)
+    print("RESPONSE CHATWOOT:", response.text)
 
     return {"status": "ok"}
-
