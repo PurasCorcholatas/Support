@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, MetaData
 from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = "postgresql+psycopg2://postgres:simon@localhost:5432/soporte_ia"
+DATABASE_URL = "postgresql+psycopg2://postgres:simon@localhost:5432/support_ia"
 
 engine = create_engine(
     DATABASE_URL,

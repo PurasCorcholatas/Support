@@ -9,6 +9,7 @@ conversation = Table(
     meta_data,
     Column("id", Integer, primary_key=True),
     Column("users", INT,ForeignKey("users.id"), nullable=False),
+    Column("zammad_ticket_id", Integer, nullable=True),
     Column("status",
         Enum("open", "closed", name="status"),
         default="open"

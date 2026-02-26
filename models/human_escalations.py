@@ -8,7 +8,7 @@ human_escalations = Table(
     "human_escalations",
     meta_data,
     Column("id", Integer, primary_key=True),
-    Column("conversation_id", Integer,ForeignKey("conversations.id"), nullable=False),
+    Column("conversation_id", Integer,ForeignKey("conversation.id"), nullable=False),
     Column("reason", String(255), nullable=False),  
     Column("escalated_at", DateTime, nullable=False, server_default=func.now()),
     Column("resolved_by", String(50), nullable=False),

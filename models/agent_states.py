@@ -9,7 +9,7 @@ agent_states = Table(
     "agent_states",
     meta_data,
     Column("id", Integer, primary_key=True),
-    Column("conversation_id", Integer,ForeignKey("conversations.id"), nullable=False),
+    Column("conversation_id", Integer,ForeignKey("conversation.id"), nullable=False),
     Column("current_step", String(100), nullable=False),
     Column("collected_data", JSONB),    
     Column("updated_at", DateTime, nullable=False, server_default=func.now()),

@@ -8,14 +8,10 @@ tickets = Table(
     "tickets",
     meta_data,
     Column("id", Integer, primary_key=True),
-    Column("conversation_id", Integer,ForeignKey("conversations.id"), nullable=False),
-    Column("zammad_ticket", Integer, nullable=False),
+    Column("conversation_id", Integer,ForeignKey("conversation.id"), nullable=False),
+    Column("zammad_ticket_id", Integer, nullable=False),
     Column("subject", String(255), nullable=False),  
-    Column("status",
-        Enum("pending", "open","closed", name="status"),
-        default="pending"
-    ),
-      
+    Column("status",String(50), nullable=False),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     Column("updated_at", DateTime, nullable=False, server_default=func.now()),
     extend_existing=True

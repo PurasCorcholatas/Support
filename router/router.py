@@ -62,7 +62,7 @@ def chat_endopoint( payload: ChatRequest):
 async def chat_webhook(request: Request):
 
     data = await request.json()
-    print(" DATA RECIBIDA:", data)
+    # print(" DATA RECIBIDA:", data)
 
     
     if data.get("event") != "message_created":
