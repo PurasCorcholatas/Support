@@ -35,7 +35,7 @@ class ZammadService:
 
 
     @staticmethod
-    def create_ticket(title: str, body: str, customer_email: str):
+    def create_ticket(title: str, body: str, customer_email: str, priority_id = 2):
         user_id = ZammadService.create_user_if_not_exists(customer_email)
 
         url = f"{ZAMMAD_URL}/tickets"
@@ -48,6 +48,7 @@ class ZammadService:
             "title": title,
             "group": "Users",
             "customer_id": user_id,
+            "priority_id": priority_id,
             "article": {
                 "subject": title,
                 "body": body,

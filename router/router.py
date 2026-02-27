@@ -43,7 +43,7 @@ def chat_endopoint( payload: ChatRequest):
     user_id = payload.session_id
     state: State = {
     "messages": [HumanMessage(content=payload.message)],
-    "intent": "general"
+    "intent": "chat_general"
 }
     
     result = graph.invoke(
