@@ -11,6 +11,7 @@ users = Table(
     Column("phone_number", INT, nullable=False),
     Column("name", String(20), nullable=False),
     Column("company", String(40), nullable=False),
+    Column("email", String(200), nullable=False, unique=True),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     extend_existing=True
 )

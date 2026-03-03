@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import ToolNode, tools_condition
+
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -10,7 +10,7 @@ from typing_extensions import TypedDict
 from dotenv import load_dotenv
 from tools.registry import tools
 from tools.functions.generator_password import generator_pw
-from sqlalchemy import select, insert
+from sqlalchemy import select, insert, update
 import re
 
 from config.db import SessionLocal
@@ -37,23 +37,48 @@ llm = ChatOpenAI(
 )
 
 
-llm_with_tools = llm.bind_tools(tools)
+
 
 
 class State(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
-    intent: Literal["chat_general", "crear_ticket", "human", "silence", "estado_ticket"]
+    intent: Literal[
+        "chat_general",
+        "crear_ticket",
+        "human",
+        "silence",
+        "estado_ticket",
+        "password_flow"]
     human_escalated: bool
-    ticket_step: Literal["ask_info","ask_title", "ask_description", "ask_email", "done"]
+    ticket_step: Literal[
+        "ask_user_info",
+        "ask_title", 
+        "ask_description",
+        "ask_email",
+        "done"]
 
-    title: str
-    description: str
-    email: str
+    password_step:Literal[
+        "ask_status",
+        "guide_change",
+        "confirm_result",
+        "ask_temps",
+        "done",
+    ]
+
+    ticket_status_step: Optional[Literal["ask_id"]]
+    account_status: Optional[str]
+    attempts: Optional[int]
+    security_risk: Optional[int]
+    priority: Optional[int]
+
+    title: Optional[str]
+    description: Optional[str]
+    email: Optional[str]
     zammad_ticket_id: int
     thread_id: Optional[str]
     flow: Optional[str]
     awaiting_confirmation: bool 
-
+   
 def langgraph(mensaje: str, thread_id: str):
 
     state: State = {
@@ -71,412 +96,326 @@ def langgraph(mensaje: str, thread_id: str):
 
 
 
-
 def router(state: State):
 
     if state.get("human_escalated"):
         return {"intent": "silence"}
-    
+
+    if state.get("password_step") and state.get("password_step") != "done":
+        return {"intent": "password_flow"}
+
     if state.get("ticket_step") and state.get("ticket_step") != "done":
         return {"intent": "crear_ticket"}
 
-    if state.get("flow") =="password":
-        return {"intent": "chat_general"}
-    history = state.get("messages", [])[-3:]
+    
+    if state.get("ticket_status_step") == "ask_id":
+        return {"intent": "estado_ticket"}
 
-    conversation_text = "\n".join(
-        str(m.content) for m in history
-    )
+    last_message = state.get("messages", [])[-1]
+    user_text = str(last_message.content).lower() if last_message else ""
+
+    
+    if "estado" in user_text and "ticket" in user_text:
+        return {
+            "intent": "estado_ticket",
+            "ticket_status_step": "ask_id"
+        }
 
     prompt = f"""
-    Eres un clasificador determinista.
-    Clasifica la intención del ÚLTIMO mensaje del usuario.
+Clasifica el mensaje:
 
-    Contexto:
-    {conversation_text}
+"{user_text}"
 
-    Responde solo con una palabra:
-    - chat_general
-    - human
-    - crear_ticket
-    -estado_ticket
-    """
+Opciones:
+- password_flow
+- crear_ticket
+- estado_ticket
+- human
+- chat_general
+
+Responde solo una palabra.
+"""
 
     response = llm.invoke([HumanMessage(content=prompt)])
-
-    content = cast(str, response.content)
-    intent = content.strip().lower().split()[0].replace(".", "")
-
-    print("Intent detectado:", intent)
+    intent = str(response.content).strip().lower().split()[0]
 
     return {"intent": intent}
 
-
-
-
 def chat_general(state: State, config):
 
-    thread_id = config["configurable"]["thread_id"]
-
-    system_prompt = f"""
+    system_prompt = """
 Eres un asistente de soporte técnico empresarial.
-
-Si el usuario menciona palabras como:
-- contraseña
-- clave
-- password
-- resetear
-- recuperar acceso
-- clave corporativa
-
-Debes usar la herramienta guia_cambio_clave.
-
-Si el usuario solicita generar una contraseña,
-usa la herramienta generar_password
-y pásale como argumento el thread_id: {thread_id}
-
-Nunca inventes contraseñas manualmente.
-Siempre usa la herramienta.
+Responde de forma clara, profesional y directa.
 """
 
     messages_state = state.get("messages", [])
 
-    if messages_state:
-        last_message = str(messages_state[-1].content).strip().lower()
-    else:
-        last_message = ""
-
-    if state.get("awaiting_confirmation"):
-        if last_message in ["si", "sí", "dale", "ok", "generala", "genérala", "esta bien", "está bien"]:
-            resultado = generator_pw.invoke({
-                "thread_id": thread_id
-            })
-            return {
-                "awaiting_confirmation": False,
-                "messages": [
-                    AIMessage(content=str(resultado))
-                ]
-            }
-        else:
-            return {
-                "awaiting_confirmation": False,
-                "messages": [
-                    AIMessage(content="Entendido, no generaré la contraseña.")
-                ]
-            }
-
     if not any(isinstance(m, SystemMessage) for m in messages_state):
         messages_state = [SystemMessage(content=system_prompt)] + messages_state
 
-    response = llm_with_tools.invoke(messages_state)
+    response = llm.invoke(messages_state)
 
     return {"messages": [response]}
 
 
 def create_ticket(state: State):
 
-    thread_id = state.get("thread_id")
     db = SessionLocal()
 
-    messages_state = state.get("messages", [])
-    last_user_message = str(messages_state[-1].content).strip()
-    step = state.get("ticket_step")
-
+    thread_id = state.get("thread_id")
     phone_number = thread_id
+    step = state.get("ticket_step")
+    messages_state = state.get("messages", [])
+    last_user_message = str(messages_state[-1].content).strip() if messages_state else ""
+
+    description = state.get("description")
 
     
 
-    stmt = select(users).where(users.c.phone_number == phone_number)
-    result = db.execute(stmt).fetchone()
+    if not description:
 
-    if result:
-        user_id = result.id
-        is_new_user = False
-    else:
-        is_new_user = True
-        user_id = None
-
-    
-
-    if not step:
-
-        if is_new_user:
-            return {
-                "ticket_step": "ask_user_info",
-                "messages": [
-                    AIMessage(
-                        content="Antes de continuar, indícame tu nombre y el nombre de tu empresa.\nEjemplo: Juan Pérez - Tech Solutions"
-                        
-                    )
-                ]
-            }
-        else:
+        if step != "ask_description":
             return {
                 "ticket_step": "ask_description",
                 "messages": [
-                    AIMessage(content="Descríbeme el problema que estás presentando.")
+                    AIMessage(
+                        content="Por favor descríbeme el problema que estás presentando."
+                    )
+                ]
+            }
+
+        
+        description = last_user_message.strip()
+
+        if not description:
+            return {
+                "ticket_step": "ask_description",
+                "messages": [
+                    AIMessage(content="La descripción no puede estar vacía.")
                 ]
             }
 
     
 
-    if step == "ask_user_info":
+    result = db.execute(
+        select(users).where(users.c.phone_number == phone_number)
+    ).fetchone()
 
-        
-        if "-" in last_user_message:
-            parts = last_user_message.split("-", 1)
-            name = parts[0].strip()
-            company = parts[1].strip()
-        else:
-            
-            extract_prompt = f"""
-            Extrae el nombre y la empresa del siguiente texto.
+    usuario_incompleto = (
+        result is None or
+        not result.name or
+        not result.company or
+        not result.email
+    )
 
-            Texto:
-            {last_user_message}
+    if usuario_incompleto:
 
-            Responde solo en este formato:
-            nombre|empresa
-            """
+        if step != "ask_user_info":
+            return {
+                "ticket_step": "ask_user_info",
+                "description": description,
+                "messages": [
+                    AIMessage(
+                        content="Antes de continuar, indícame tu nombre completo, empresa y correo corporativo.\nFormato: Nombre - Empresa - correo@empresa.com"
+                    )
+                ]
+            }
 
-            response = llm.invoke([HumanMessage(content=extract_prompt)])
-            content = str(response.content).strip()
+       
+        parts = last_user_message.split("-")
 
-            if "|" in content:
-                name, company = content.split("|", 1)
-                name = name.strip()
-                company = company.strip()
-            else:
-                name = last_user_message
-                company = "No especificada"
+        if len(parts) < 3:
+            return {
+                "ticket_step": "ask_user_info",
+                "description": description,
+                "messages": [
+                    AIMessage(
+                        content="Formato incorrecto. Usa: Nombre - Empresa - correo@empresa.com"
+                    )
+                ]
+            }
 
-        
-        stmt = (
-            insert(users)
-            .values(
-                phone_number=phone_number,
-                name=name,
-                company=company
+        name = parts[0].strip()
+        company = parts[1].strip()
+        email = parts[2].strip()
+
+        if not name or not company or not email:
+            return {
+                "ticket_step": "ask_user_info",
+                "description": description,
+                "messages": [
+                    AIMessage(
+                        content="Todos los campos son obligatorios. Usa: Nombre - Empresa - correo@empresa.com"
+                    )
+                ]
+            }
+
+        if result:
+            db.execute(
+                update(users)
+                .where(users.c.phone_number == phone_number)
+                .values(name=name, company=company, email=email)
             )
-            .returning(users.c.id)
-        )
+            user_id = result.id
+        else:
+            stmt_insert = (
+                insert(users)
+                .values(
+                    phone_number=phone_number,
+                    name=name,
+                    company=company,
+                    email=email
+                )
+                .returning(users.c.id)
+            )
+            user_id = db.execute(stmt_insert).scalar_one()
 
-        user_id = db.execute(stmt).scalar_one()
         db.commit()
 
-        return {
-            "ticket_step": "ask_description",
-            "messages": [
-                AIMessage(
-                    content="Perfecto. Ahora descríbeme el problema que estás presentando."
-                )
-            ]
-        }
+        
+        result = db.execute(
+            select(users).where(users.c.phone_number == phone_number)
+        ).fetchone()
+
+        if not result:
+            return {
+                "ticket_step": "ask_user_info",
+                "description": description,
+                "messages": [
+                    AIMessage(content="Error guardando datos. Intenta nuevamente.")
+                ]
+            }
 
     
 
-    stmt = select(conversation).where(
+    if not description:
+        return {
+            "ticket_step": "ask_description",
+            "messages": [
+                AIMessage(content="Necesito la descripción del problema para continuar.")
+            ]
+        }
+
+    if not result:
+        return {
+            "ticket_step": "ask_user_info",
+            "description": description,
+            "messages": [
+                AIMessage(content="Necesito tus datos antes de crear el ticket.")
+            ]
+        }
+
+    user_id = result.id
+    name = result.name
+    company = result.company
+    customer_email = result.email
+
+   
+
+    stmt_conv = select(conversation).where(
         conversation.c.users == user_id,
         conversation.c.status == "open"
     )
 
-    result = db.execute(stmt).fetchone()
+    conv_result = db.execute(stmt_conv).fetchone()
 
-    if result:
-        conversation_id = result.id
+    if conv_result:
+        conversation_id = conv_result.id
     else:
-        stmt = (
+        stmt_new_conv = (
             insert(conversation)
-            .values(
-                users=user_id,
-                status="open"
-            )
+            .values(users=user_id, status="open")
             .returning(conversation.c.id)
         )
-        conversation_id = db.execute(stmt).scalar_one()
+        conversation_id = db.execute(stmt_new_conv).scalar_one()
         db.commit()
 
-   
-    db.execute(
-        insert(messages).values(
-            conversation_id=conversation_id,
-            sender="user",
-            company="",
-            message_text=last_user_message
-        )
-    )
-    db.commit()
+    
 
- 
+    subject = description[:60] if description else "Nuevo Ticket"
 
-    if step == "ask_description":
+    body_final = f"""
+{description}
 
-        description = last_user_message
-
-        title_prompt = f"""
-        Genera un título corto y profesional (máximo 8 palabras)
-        para este ticket:
-
-        {description}
-
-        Solo responde el título.
-        """
-
-        title = str(
-            llm.invoke([HumanMessage(content=title_prompt)]).content
-        ).strip().replace('"', '')
-
-        priority_prompt = f"""
-        Clasifica la prioridad del problema:
-
-        {description}
-
-        Responde solo: baja, media o alta
-        """
-
-        priority_text = str(
-            llm.invoke([HumanMessage(content=priority_prompt)]).content
-        ).strip().lower()
-
-        priority_map = {
-            "baja": 1,
-            "media": 2,
-            "alta": 3
-        }
-
-        priority = priority_map.get(priority_text, 2)
-
-        return {
-            "description": description,
-            "title": title,
-            "priority": priority,
-            "ticket_step": "ask_email",
-            "messages": [
-                AIMessage(
-                    content=f"""He generado:
-            Título: {title}
-            Prioridad: {priority_text.upper()}
-
-        Ahora indícame tu correo electrónico."""
-                )
-            ]
-        }
-
-  
-    if step == "ask_email":
-
-        title = state.get("title") or ""
-        description = state.get("description") or ""
-        priority = state.get("priority") or 2
-
-        stmt = select(users).where(users.c.phone_number == phone_number)
-        user = db.execute(stmt).fetchone()
-
-        name = user.name if user else "Sin nombre"
-        company = user.company if user else "Sin empresa"
-
-        extra_info = f"""
-
--------------------------
-Información adicional
 -------------------------
 Nombre: {name}
 Empresa: {company}
+Correo: {customer_email}
 Teléfono: {phone_number}
 """
 
-        full_body = description + extra_info
+    ticket = ZammadService.create_ticket(
+        title=subject,
+        body=body_final,
+        customer_email=customer_email,
+        priority_id=2
+    )
 
-        ticket = ZammadService.create_ticket(
-            title=title,
-            body=full_body,
-            customer_email=last_user_message,
-            priority_id=priority
+    zammad_id = ticket["id"]
+
+    db.execute(
+        insert(tickets).values(
+            conversation_id=conversation_id,
+            zammad_ticket_id=zammad_id,
+            subject=subject,
+            status="new"
         )
+    )
 
-        zammad_id = ticket["id"]
+    db.commit()
 
-        db.execute(
-            insert(tickets).values(
-                conversation_id=conversation_id,
-                zammad_ticket_id=zammad_id,
-                subject=title,
-                status="new"
+   
+
+    return {
+        "ticket_step": None,
+        "description": None,
+        "messages": [
+            AIMessage(
+                content=f"Te he creado un ticket con el ID {zammad_id}, a la mayor brevedad se solucionara tu problema. ¿Necesitas algo más?"
             )
-        )
-        db.commit()
+        ]
+    }
+    
 
-        return {
-            "ticket_step": "done",
-            "intent": "general",
-            "messages": [
-                AIMessage(
-                    content=f"El ticket fue creado correctamente con ID {zammad_id}"
-                )
-            ]
-        }
-        
+def check_status_ticket(state: State):
 
-
-def check_status_ticket(state:State):
-
-    thread_id = state.get("thread_id")
     db = SessionLocal()
+    thread_id = state.get("thread_id")
+    step = state.get("ticket_status_step")
 
     messages_state = state.get("messages", [])
+    last_message = str(messages_state[-1].content).strip()
+
     
-    if not messages_state:
-        return{
-            "messages": [AIMessage(
-                content= "No hay mensajes para procesar"
-            )]
-        }
-    
-    
-    last_message: str = str (messages_state[-1].content)
-    
-    stmt_user = select(users).where(users.c.phone_number == thread_id)
-    user = db.execute(stmt_user).fetchone()
-    
-    
-    if not user:
-        return {
-            "messages": [AIMessage(
-                content="No encontré usuario asociado a esta conversación."
-            )]
-        }
-    
-    match = re.search(r"\d+", last_message)
-    
-    if match:
-        ticket_id = int(match.group())
-    
+    if step == "ask_id":
+
+        if not re.fullmatch(r"\d+", last_message):
+            return {
+                "ticket_status_step": "ask_id",
+                "messages": [
+                    AIMessage(content="Por favor indícame únicamente el número del ticket.")
+                ]
+            }
+
+        ticket_id = int(last_message)
+
+        
+        state["ticket_status_step"] = None
+
     else:
-        stmt_last_ticket = (
-            select(tickets)
-            .join(conversation, tickets.c.conversation_id == conversation.c.id)
-            .where(conversation.c.users == user.id)
-            .order_by(tickets.c.id.desc())
-        )
         
-        last_ticket = db.execute(stmt_last_ticket).fetchone()
-        
-        
-    if not last_ticket:
-        return {
-            "messages":[AIMessage(
-                content= "No encontre tickets asosciados a tu cuenta"
-            )]
-        }
-        
-    ticket_id = last_ticket.zammad_ticket_id
-    
-    
+        match = re.search(r"\d+", last_message)
+        if not match:
+            return {
+                "ticket_status_step": "ask_id",
+                "messages": [
+                    AIMessage(content="Indícame el ID del ticket que deseas consultar.")
+                ]
+            }
+        ticket_id = int(match.group())
 
     try:
         zammad_ticket = ZammadService.get_ticket(ticket_id)
-
-        state_id = zammad_ticket.get("state_id")
 
         ESTADOS = {
             1: "Nuevo",
@@ -485,25 +424,167 @@ def check_status_ticket(state:State):
             4: "Cerrado"
         }
 
-        status = ESTADOS.get(state_id, f"Desconocido ({state_id})")
+        status = ESTADOS.get(zammad_ticket.get("state_id"))
 
         return {
-            "messages": [AIMessage(
-                content=f"El ticket #{ticket_id} actualmente se encuentra en estado: {status}"
-            )]
+            "ticket_status_step": None,
+            "messages": [
+                AIMessage(
+                    content=f"El ticket #{ticket_id} se encuentra en estado: {status}"
+                )
+            ]
         }
 
-    except Exception as e:
-        print("Error consultando Zammad:", e)
-
+    except Exception:
         return {
-            "messages": [AIMessage(
-                content="Hubo un error consultando el estado"
-            )]
+            "messages": [
+                AIMessage(content="No encontré un ticket con ese ID.")
+            ]
         }
 
+def handle_password_issue(state: State):
+
+    messages_state = state.get("messages", [])
+    last_message = str(messages_state[-1].content).strip().lower()
+    step = state.get("password_step")
+
+    
+    if re.search(r"\b(mi\s)?(clave|contraseña|password)\s+es\b", last_message):
+        return {
+            "messages": [
+                AIMessage(content="Por seguridad, nunca compartas tu contraseña. El equipo de soporte jamás te la pedirá.")
+            ]
+        }
+
+    
+
+    if not step:
+
+        if "no puedo acceder" in last_message or "no puedo entrar" in last_message:
+            return {
+                "flow": "access_issue",
+                "password_step": "ask_recent_change",
+                "messages": [
+                    AIMessage(content="¿Has cambiado la contraseña en los últimos 3 meses? (si/no)")
+                ]
+            }
+
+        if "correo" in last_message and "bloque" in last_message:
+            return {
+                "flow": "correo_bloqueado",
+                "password_step": "ask_attempts",
+                "messages": [
+                    AIMessage(content="¿Cuántos intentos fallidos realizaste antes de que se bloqueara?")
+                ]
+            }
+
+        
+        return {
+            "password_step": "ask_recent_change",
+            "flow": "access_issue",
+            "messages": [
+                AIMessage(content="¿Has cambiado la contraseña en los últimos 3 meses? (si/no)")
+            ]
+        }
+
+   
+
+    if step == "ask_recent_change":
+
+        if last_message in ["si", "sí", "ok", "yes"]:
+
+            
+            return {
+                "password_step": "done",
+                "intent": "crear_ticket",
+                "description": "Usuario no puede acceder a su cuenta después de cambio reciente de contraseña. Posible bloqueo.",
+                "priority": 3
+            }
+
+        else:
+
+            
+            return {
+                "password_step": "guide_change",
+                "messages": [
+                    AIMessage(content="""
+Te guiaré para cambiar tu contraseña correctamente:
+
+1. Mínimo 12 caracteres
+2. Al menos 1 mayúscula
+3. Incluir números
+4. Incluir caracteres especiales
+5. No usar tu nombre ni empresa
+
+Avísame cuando la hayas cambiado.
+""")
+                ]
+            }
+
+    if step == "guide_change":
+        return {
+            "password_step": "confirm_result",
+            "messages": [
+                AIMessage(content="¿Ahora puedes acceder correctamente? (si/no)")
+            ]
+        }
+
+    if step == "confirm_result":
+
+        if last_message in ["si", "sí", "ok", "listo", "ya"]:
+            return {
+                "password_step": None,
+                "messages": [
+                    AIMessage(content="Perfecto, me alegra que se haya solucionado. ¿Necesitas algo más?")
+                ]
+            }
+
+        else:
+            return {
+                "password_step": "done",
+                "intent": "crear_ticket",
+                "description": "Usuario no puede acceder a su cuenta después de intentar cambio de contraseña.",
+                "priority": 2
+            }
+
+    
+
+    if step == "ask_attempts":
+
+        match = re.search(r"\d+", last_message)
+
+        if match:
+            attempts = int(match.group())
+        else:
+            attempts = 1
+
+        if attempts > 3:
+            
+            return {
+                "attempts": attempts,
+                "security_risk": 2,
+                "priority": 3,
+                "password_step": "done",
+                "intent": "crear_ticket",
+                "description": f"Cuenta de correo bloqueada después de {attempts} intentos fallidos."
+            }
+        else:
+            
+            return {
+                "password_step": "guide_change",
+                "messages": [
+                    AIMessage(content="Parece un bloqueo temporal. Intentemos cambiar la contraseña primero.")
+                ]
+            }
+
+    return {"password_step": None}
 
 def escalate_human(state: State):
+
+    db = SessionLocal()
+
+    thread_id = state.get("thread_id")
+    messages_state = state.get("messages", [])
 
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.environ["SMTP_PORT"])
@@ -511,8 +592,57 @@ def escalate_human(state: State):
     smtp_password = os.environ["SMTP_PASSWORD"]
     destino = os.environ["DESTINO_SOPORTE"]
 
-    msg = MIMEText("Se solicitó atención humana.")
-    msg["Subject"] = "Escalación a humano"
+    
+    stmt_user = select(users).where(users.c.phone_number == thread_id)
+    user = db.execute(stmt_user).fetchone()
+
+    if user:
+        nombre = user.name
+        empresa = user.company
+        correo = user.email
+    else:
+        nombre = "No registrado"
+        empresa = "No registrada"
+        correo = "No disponible"
+
+    
+    historial = ""
+    for msg in messages_state:
+        role = "Usuario" if msg.type == "human" else "Bot"
+        historial += f"{role}: {msg.content}\n"
+
+    
+    chatwoot_base_url = os.environ.get("https://app.chatwoot.com")
+    chatwoot_link = f"{chatwoot_base_url}/app/accounts/1/conversations/{thread_id}"
+
+    
+    cuerpo = f"""
+ ESCALACIÓN A SOPORTE HUMANO
+
+
+INFORMACIÓN DEL CLIENTE
+
+Nombre: {nombre}
+Empresa: {empresa}
+Correo: {correo}
+Teléfono / ID Conversación: {thread_id}
+
+
+CONTEXTO COMPLETO DE LA CONVERSACIÓN
+
+{historial}
+
+
+ACCESO DIRECTO A CHATWOOT
+
+{chatwoot_link}
+
+
+Este caso requiere intervención manual.
+"""
+
+    msg = MIMEText(cuerpo)
+    msg["Subject"] = f" Escalación Soporte - {nombre} ({empresa})"
     msg["From"] = smtp_email
     msg["To"] = destino
 
@@ -537,7 +667,7 @@ def silence(state: State):
     return {"messages": []}
 
 
-tool_node = ToolNode(tools)
+
 
 builder = StateGraph(State)
 
@@ -546,7 +676,8 @@ builder.add_node("chat_general", chat_general)
 builder.add_node("create_ticket", create_ticket)
 builder.add_node("check_status_ticket", check_status_ticket)
 builder.add_node("escalate_human", escalate_human)
-builder.add_node("tools", tool_node)
+builder.add_node("handle_password_issue", handle_password_issue)
+
 
 builder.add_node("silence", silence)
 
@@ -560,20 +691,26 @@ builder.add_conditional_edges(
         "crear_ticket": "create_ticket",
         "estado_ticket": "check_status_ticket",
         "human": "escalate_human",
+        "password_flow": "handle_password_issue",
         "silence": "silence",
     }
 )
 
-builder.add_edge("chat_general", END)
+builder.add_conditional_edges(
+    "handle_password_issue",
+    lambda state: state.get("intent", "chat_general"),
+    {
+        "crear_ticket": "create_ticket",
+        "chat_general": END,
+        "password_flow": END,
+    }
+)
 builder.add_edge("create_ticket", END)
 builder.add_edge("check_status_ticket", END)
-builder.add_edge("tools", "chat_general")
 
 
-builder.add_conditional_edges(
-    "chat_general",
-    tools_condition,
-) 
+
+
 
 builder.add_edge("escalate_human", END)
 builder.add_edge("silence", END)
