@@ -49,7 +49,29 @@ class State(TypedDict, total=False):
         "silence",
         "estado_ticket",
         "password_flow"]
-    human_escalated: bool
+    
+    
+    conversation_status: Optional[Literal[
+        "bot_active",
+        "human_active",
+        "closed"
+    ]]
+    
+    password_step:Literal[
+        "confirm_owner",
+        "ask_email",
+        "ask_device",
+        "ask_location",
+        "ask_last_access",
+        "evaluate",
+        "done"
+    ]
+    
+    security_risk: Optional[int]
+    
+    description: Optional[str]
+    thread_id: Optional[str]
+    
     ticket_step: Literal[
         "ask_user_info",
         "ask_title", 
@@ -57,34 +79,26 @@ class State(TypedDict, total=False):
         "ask_email",
         "done"]
 
-    password_step:Literal[
-        "ask_status",
-        "guide_change",
-        "confirm_result",
-        "ask_temps",
-        "done",
-    ]
+    
 
     ticket_status_step: Optional[Literal["ask_id"]]
-    account_status: Optional[str]
-    attempts: Optional[int]
-    security_risk: Optional[int]
-    priority: Optional[int]
-
-    title: Optional[str]
+    
     description: Optional[str]
-    email: Optional[str]
-    zammad_ticket_id: int
     thread_id: Optional[str]
-    flow: Optional[str]
-    awaiting_confirmation: bool 
+    device: Optional[str]
+    location: Optional[str]
+    validation_summary: Optional[dict]
+
    
 def langgraph(mensaje: str, thread_id: str):
+
+    db = SessionLocal()
 
     state: State = {
         "messages": [HumanMessage(content=mensaje)],
         "intent": "chat_general",
-        "thread_id": thread_id
+        "thread_id": thread_id,
+        "conversation_status": "bot_active"
     }
 
     result = graph.invoke(
@@ -92,13 +106,48 @@ def langgraph(mensaje: str, thread_id: str):
         config={"configurable": {"thread_id": thread_id}}
     )
 
-    return result["messages"][-1].content
+    final_message = result["messages"][-1].content
 
+    
+    stmt_user = select(users).where(users.c.phone_number == thread_id)
+    user = db.execute(stmt_user).fetchone()
+
+    if user:
+        stmt_conv = select(conversation).where(
+            conversation.c.users == user.id,
+            conversation.c.status == "open"
+        )
+        conv = db.execute(stmt_conv).fetchone()
+
+        if conv:
+            conversation_id = conv.id
+
+            db.execute(
+                insert(messages).values(
+                    conversation_id=conversation_id,
+                    sender="user",
+                    message_text=mensaje,
+                    company=user.company
+                )
+            )
+
+            db.execute(
+                insert(messages).values(
+                    conversation_id=conversation_id,
+                    sender="bot",
+                    message_text=final_message,
+                    company=user.company
+                )
+            )
+
+        db.commit()
+        
+    return final_message
 
 
 def router(state: State):
 
-    if state.get("human_escalated"):
+    if state.get("conversation_status") == "human_active":
         return {"intent": "silence"}
 
     if state.get("password_step") and state.get("password_step") != "done":
@@ -139,7 +188,9 @@ Responde solo una palabra.
     response = llm.invoke([HumanMessage(content=prompt)])
     intent = str(response.content).strip().lower().split()[0]
 
-    return {"intent": intent}
+    return {"intent": intent,
+            "conversation_status": "bot_active"
+    }
 
 def chat_general(state: State, config):
 
@@ -353,6 +404,7 @@ Teléfono: {phone_number}
 
     zammad_id = ticket["id"]
 
+    
     db.execute(
         insert(tickets).values(
             conversation_id=conversation_id,
@@ -364,17 +416,39 @@ Teléfono: {phone_number}
 
     db.commit()
 
-   
+    
+
+    validation = state.get("validation_summary")
+
+    if validation:
+
+        resumen = f"""
+VALIDACIÓN REALIZADA POR BOT
+
+Tipo de solicitud: {validation.get("tipo")}
+Dispositivo habitual: {validation.get("dispositivo")}
+Ubicación habitual: {validation.get("ubicacion")}
+Último acceso: {validation.get("ultimo_acceso")}
+Nivel de riesgo calculado: {validation.get("riesgo")}
+"""
+
+        ZammadService.add_note(
+            ticket_id=zammad_id,
+            body=resumen,
+            internal=True
+        )
+
+    
 
     return {
         "ticket_step": None,
         "description": None,
         "messages": [
             AIMessage(
-                content=f"Te he creado un ticket con el ID {zammad_id}, a la mayor brevedad se solucionara tu problema. ¿Necesitas algo más?"
+                content=f"Te he creado un ticket con el ID {zammad_id}. A la mayor brevedad se solucionará tu problema. ¿Necesitas algo más?"
             )
         ]
-    }
+    } 
     
 
 def check_status_ticket(state: State):
@@ -447,8 +521,9 @@ def handle_password_issue(state: State):
     messages_state = state.get("messages", [])
     last_message = str(messages_state[-1].content).strip().lower()
     step = state.get("password_step")
-
+    risk = state.get("security_risk", 0)
     
+       
     if re.search(r"\b(mi\s)?(clave|contraseña|password)\s+es\b", last_message):
         return {
             "messages": [
@@ -459,125 +534,113 @@ def handle_password_issue(state: State):
     
 
     if not step:
+        return {
+            "password_step": "confirm_owner",
+            "security_risk": 0,
+            "messages": [
+                AIMessage(content="¿Esta solicitud corresponde unicamente a tu cuenta corporativa? (si/no) ")
+                
+            ]
+        }
 
-        if "no puedo acceder" in last_message or "no puedo entrar" in last_message:
-            return {
-                "flow": "access_issue",
-                "password_step": "ask_recent_change",
+    if step == "confirm_owner":
+        if last_message not in ["si", "si", "yes"]:
+            return{
+                "password_step": "done",
                 "messages": [
-                    AIMessage(content="¿Has cambiado la contraseña en los últimos 3 meses? (si/no)")
+                    AIMessage(content="Solo puedo ayudarte con solicitudes de tu propia cuenta")
                 ]
             }
 
-        if "correo" in last_message and "bloque" in last_message:
+        return {
+            "password_step": "ask_email",
+            "messages":[
+                AIMessage(content="Indicame tu coreo corporativo")
+            ]
+        }
+
+
+    if step == "ask_email":
+        
+        risk = int(state.get("security_risk") or 0)
+        
+        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", last_message):
             return {
-                "flow": "correo_bloqueado",
-                "password_step": "ask_attempts",
+                "password_step": "ask_email",
+                "security_risk": risk + 1,
                 "messages": [
-                    AIMessage(content="¿Cuántos intentos fallidos realizaste antes de que se bloqueara?")
+                    AIMessage("Formato de correo invalido")
                 ]
             }
+            
 
+        return {
+            "password_step": "ask_device",
+            "messages":[
+                AIMessage(content="¿Desde que dispositivo de accesdes normalmente) (navegador,movil) ")
+            ]
+        }
+
+    risk = int(state.get("security_risk") or 0)
+
+    if step == "ask_device":
+        if len(last_message) < 3:
+            risk += 1
         
         return {
-            "password_step": "ask_recent_change",
-            "flow": "access_issue",
+            "password_step": "ask_location",
+            "security_risk": risk,
+            "device": last_message,
             "messages": [
-                AIMessage(content="¿Has cambiado la contraseña en los últimos 3 meses? (si/no)")
+                AIMessage(content = "¿Sueles ingresar desde oficina o remoto?")
             ]
         }
 
-   
+    if step == "ask_location":
+        if last_message not in ["oficina", "remoto"]:
+            risk +=1
+        return{
+            "password_step": "ask_last_access",
+            "security_risk": risk,
+            "device": state.get("device"),
+            "location": last_message,
+            "messages": [
+                AIMessage(content=("¿Recuerdas cuando fue tu ultimo acceso?"))
+            ]
+        }
 
-    if step == "ask_recent_change":
 
-        if last_message in ["si", "sí", "ok", "yes"]:
-
+    if step == "ask_last_access":
+        
+        if len(last_message) < 3:
+            risk += 1
             
-            return {
+        if risk >= 2:
+            return{
                 "password_step": "done",
-                "intent": "crear_ticket",
-                "description": "Usuario no puede acceder a su cuenta después de cambio reciente de contraseña. Posible bloqueo.",
-                "priority": 3
+                "security_risk": risk,
+                "intent": "human"
             }
-
-        else:
-
-            
-            return {
-                "password_step": "guide_change",
-                "messages": [
-                    AIMessage(content="""
-Te guiaré para cambiar tu contraseña correctamente:
-
-1. Mínimo 12 caracteres
-2. Al menos 1 mayúscula
-3. Incluir números
-4. Incluir caracteres especiales
-5. No usar tu nombre ni empresa
-
-Avísame cuando la hayas cambiado.
-""")
-                ]
-            }
-
-    if step == "guide_change":
+        
         return {
-            "password_step": "confirm_result",
-            "messages": [
-                AIMessage(content="¿Ahora puedes acceder correctamente? (si/no)")
-            ]
+            "password_step": "done",
+            "security_risk": risk,
+            "intent": "crear_ticket",
+            "description": "Solicitud de cambio de contraseña validada por bot",
+            "device": state.get("device"),
+            "location": state.get("location"),
+            "validation_summary": {
+                "tipo": "Cambio de contraseña",
+                "dispositivo": state.get("device"),
+                "ubicacion": state.get("location"),
+                "ultimo_acceso": last_message,
+                "riesgo": risk
+            }
         }
 
-    if step == "confirm_result":
 
-        if last_message in ["si", "sí", "ok", "listo", "ya"]:
-            return {
-                "password_step": None,
-                "messages": [
-                    AIMessage(content="Perfecto, me alegra que se haya solucionado. ¿Necesitas algo más?")
-                ]
-            }
-
-        else:
-            return {
-                "password_step": "done",
-                "intent": "crear_ticket",
-                "description": "Usuario no puede acceder a su cuenta después de intentar cambio de contraseña.",
-                "priority": 2
-            }
 
     
-
-    if step == "ask_attempts":
-
-        match = re.search(r"\d+", last_message)
-
-        if match:
-            attempts = int(match.group())
-        else:
-            attempts = 1
-
-        if attempts > 3:
-            
-            return {
-                "attempts": attempts,
-                "security_risk": 2,
-                "priority": 3,
-                "password_step": "done",
-                "intent": "crear_ticket",
-                "description": f"Cuenta de correo bloqueada después de {attempts} intentos fallidos."
-            }
-        else:
-            
-            return {
-                "password_step": "guide_change",
-                "messages": [
-                    AIMessage(content="Parece un bloqueo temporal. Intentemos cambiar la contraseña primero.")
-                ]
-            }
-
-    return {"password_step": None}
 
 def escalate_human(state: State):
 
@@ -655,13 +718,11 @@ Este caso requiere intervención manual.
         print("Error enviando correo:", e)
 
     return {
-        "messages": [{
-            "role": "assistant",
-            "content": "He notificado a un asesor humano. En breve continuará contigo."
-        }],
-        "human_escalated": True
-    }
-
+    "messages": [
+        AIMessage(content="Te estoy conectando con un técnico. En breve continuará contigo.")
+    ],
+    "conversation_status": "human_active"
+}
 
 def silence(state: State):
     return {"messages": []}
@@ -701,10 +762,12 @@ builder.add_conditional_edges(
     lambda state: state.get("intent", "chat_general"),
     {
         "crear_ticket": "create_ticket",
+        "human": "escalate_human",
         "chat_general": END,
         "password_flow": END,
     }
 )
+
 builder.add_edge("create_ticket", END)
 builder.add_edge("check_status_ticket", END)
 
