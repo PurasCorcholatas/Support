@@ -2,14 +2,13 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 
-from langchain_core.tools import tool
+
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from typing import List, Literal, Annotated, cast, Optional
+from typing import List, Literal, Annotated, Optional
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
-from tools.registry import tools
-from tools.functions.generator_password import generator_pw
+
 from sqlalchemy import select, insert, update
 import re
 
@@ -19,8 +18,20 @@ from models.conversations import conversation
 from models.messages import messages
 from models.tickets import tickets
 
+from security.profile_engine import (
+    build_account_profile,
+    generate_adaptive_questions
+)
+from security.question_engine import (
+    QUESTION_BANK,
+    select_initial_quetions,
+    select_additional_question,
+    get_question_text
+)
 
+from security.scoring_engine import calculate_security_score
 
+from services.zimbra_service import ZimbraService
 from services.zammad_services import ZammadService
 
 import smtplib
@@ -60,14 +71,19 @@ class State(TypedDict, total=False):
     password_step:Literal[
         "confirm_owner",
         "ask_email",
-        "ask_device",
-        "ask_location",
-        "ask_last_access",
-        "evaluate",
+        "ask_recent_change",
+        "ask_send_email",
+        "dynamic_question",
+        "waiting_confirmation",
+        "confirmation_continue",
         "done"
     ]
     
     security_risk: Optional[int]
+    real_data: Optional[dict]
+    security_questions: Optional[List[str]]
+    user_answers: Optional[dict]
+    
     
     description: Optional[str]
     thread_id: Optional[str]
@@ -84,9 +100,8 @@ class State(TypedDict, total=False):
     ticket_status_step: Optional[Literal["ask_id"]]
     
     description: Optional[str]
-    thread_id: Optional[str]
-    device: Optional[str]
-    location: Optional[str]
+    current_question_index: Optional[int]
+    email: Optional[str]
     validation_summary: Optional[dict]
 
    
@@ -159,16 +174,44 @@ def router(state: State):
     
     if state.get("ticket_status_step") == "ask_id":
         return {"intent": "estado_ticket"}
+    
+    
+    
 
     last_message = state.get("messages", [])[-1]
     user_text = str(last_message.content).lower() if last_message else ""
 
-    
-    if "estado" in user_text and "ticket" in user_text:
+        
+
+
+    if "ticket" in user_text and "estado" in user_text:
         return {
             "intent": "estado_ticket",
             "ticket_status_step": "ask_id"
-        }
+        }    
+        
+    password_keywords = [
+        "contraseña",
+        "clave",
+        "password",
+        "no puedo entrar",
+        "no puedo ingresar",
+        "error autenticacion",
+        "error autenticación",
+        "correo no funciona",
+        "no funciona mi correo",
+        "problema de acceso"
+    ]   
+    
+    
+    if any(word in user_text for word in password_keywords):
+        return {"intent": "password_flow"}
+        
+    if "ticket" in user_text:
+        return {"intent": "crear_ticket"}
+    
+    if "humano" in user_text or "agente" in user_text:
+        return {"intent": "human"}
 
     prompt = f"""
 Clasifica el mensaje:
@@ -246,7 +289,39 @@ def create_ticket(state: State):
                 ]
             }
 
-    
+                
+        description_clean = description.lower()   
+         
+        password_keywords = [
+            "clave",
+            "contraseña",
+            "password",
+            "no puedo entrar",
+            "no puedo ingresar",
+            "problema de acceso",
+            "correo no funciona",
+            "no funciona mi correo",
+            "error autenticacion",
+            "error autenticación"
+        ]
+         
+        if any(word in description_clean for word in password_keywords):
+            return {
+                "password_step": "confirmation_continue",
+                "ticket_step": None,
+                "description": None,
+                "messages":[
+                    AIMessage(
+                        content="""Parece que tu problema es relacionado con acceso o contraseña del correo.
+                        ¿Quieres que te ayude a recuperarla ahora mismo? (si/no)
+                        """
+                    )
+                ]
+            }
+
+        
+        
+       
 
     result = db.execute(
         select(users).where(users.c.phone_number == phone_number)
@@ -522,8 +597,7 @@ def handle_password_issue(state: State):
     last_message = str(messages_state[-1].content).strip().lower()
     step = state.get("password_step")
     risk = state.get("security_risk", 0)
-    
-       
+
     if re.search(r"\b(mi\s)?(clave|contraseña|password)\s+es\b", last_message):
         return {
             "messages": [
@@ -531,22 +605,19 @@ def handle_password_issue(state: State):
             ]
         }
 
-    
-
     if not step:
         return {
             "password_step": "confirm_owner",
             "security_risk": 0,
             "messages": [
                 AIMessage(content="¿Esta solicitud corresponde unicamente a tu cuenta corporativa? (si/no) ")
-                
             ]
         }
 
     if step == "confirm_owner":
         if last_message not in ["si", "si", "yes"]:
-            return{
-                "password_step": "done",
+            return {
+                "password_step": "chat_general",
                 "messages": [
                     AIMessage(content="Solo puedo ayudarte con solicitudes de tu propia cuenta")
                 ]
@@ -554,93 +625,253 @@ def handle_password_issue(state: State):
 
         return {
             "password_step": "ask_email",
-            "messages":[
+            "messages": [
                 AIMessage(content="Indicame tu coreo corporativo")
             ]
         }
 
-
     if step == "ask_email":
-        
-        risk = int(state.get("security_risk") or 0)
-        
+
         if not re.match(r"^[^@]+@[^@]+\.[^@]+$", last_message):
             return {
                 "password_step": "ask_email",
-                "security_risk": risk + 1,
                 "messages": [
-                    AIMessage("Formato de correo invalido")
+                    AIMessage(content="Formato de correo invalido")
                 ]
             }
+
+        try:
+            zimbra = ZimbraService(
+                url="https://correo.serviunix.com/service/soap",
+                email=last_message,
+                password=os.environ.get("ZIMBRA_PASSWORD")
+            )
             
+            zimbra.authenticate()
+
+            real_data = {
+                "folders": zimbra.get_user_folders(),
+                "last_sent_subjects": zimbra.get_last_sent_subjects(),
+                "signature": zimbra.get_user_signature(),
+                "contacts": zimbra.get_contacts(),
+                "filters": zimbra.get_filters(),
+            }
+
+        except Exception as e:
+            print("Error conectando con Zimbra:", e)
+            return {"intent": "human"}
 
         return {
-            "password_step": "ask_device",
-            "messages":[
-                AIMessage(content="¿Desde que dispositivo de accesdes normalmente) (navegador,movil) ")
-            ]
-        }
-
-    risk = int(state.get("security_risk") or 0)
-
-    if step == "ask_device":
-        if len(last_message) < 3:
-            risk += 1
-        
-        return {
-            "password_step": "ask_location",
-            "security_risk": risk,
-            "device": last_message,
+            "password_step": "ask_recent_change",
+            "email": last_message,
+            "real_data": real_data,  
             "messages": [
-                AIMessage(content = "¿Sueles ingresar desde oficina o remoto?")
-            ]
-        }
-
-    if step == "ask_location":
-        if last_message not in ["oficina", "remoto"]:
-            risk +=1
-        return{
-            "password_step": "ask_last_access",
-            "security_risk": risk,
-            "device": state.get("device"),
-            "location": last_message,
-            "messages": [
-                AIMessage(content=("¿Recuerdas cuando fue tu ultimo acceso?"))
+                AIMessage(
+                    content="¿Has cambiado tu contraseña en los últimos 3 meses? (si/no)"
+                )
             ]
         }
 
 
-    if step == "ask_last_access":
+    if step == "confirmation_continue":
         
-        if len(last_message) < 3:
-            risk += 1
-            
-        if risk >= 2:
+        if last_message in ["si", "SI", "Si", "sí"]:
             return{
+                "password_step": "confirm_owner",
+                "messages": [
+                    AIMessage (
+                        content="Perfecto. Primero confirmes algo. Esta solicitud corresponde unicamente a tu cuenta corporativa? (si/no) "
+                    )
+                ]
+            }
+        
+        if last_message == "no":
+            return {
                 "password_step": "done",
-                "security_risk": risk,
-                "intent": "human"
+                "intent": "crear_ticket",
+                "ticket_step": "ask_description",
+                "messages": [
+                    AIMessage(
+                content="Entiendo. Entonces crearé el ticket para que soporte revise tu caso."
+                    )
+                ],
+                
             }
         
         return {
-            "password_step": "done",
-            "security_risk": risk,
-            "intent": "crear_ticket",
-            "description": "Solicitud de cambio de contraseña validada por bot",
-            "device": state.get("device"),
-            "location": state.get("location"),
-            "validation_summary": {
-                "tipo": "Cambio de contraseña",
-                "dispositivo": state.get("device"),
-                "ubicacion": state.get("location"),
-                "ultimo_acceso": last_message,
-                "riesgo": risk
-            }
+            "password_step": "confirmation_continue",
+            "messages":[
+                AIMessage(
+                    content="Responde unicamente si o no"
+                )
+            ]
         }
 
 
 
-    
+    if step == "ask_recent_change":
+
+        if last_message not in ["si", "sí", "no"]:
+                return {
+                    "password_step": "ask_recent_change",
+                    "messages": [
+                        AIMessage(
+                            content="Responde únicamente si o no. ¿Has cambiado tu contraseña en los últimos 3 meses?"
+                        )
+                    ]
+                }
+
+            
+        if last_message in ["no", "no"]:
+                return {
+                    "password_step": "waiting_confirmation",
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "Perfecto. Sigue estos pasos para restablecer tu contraseña:\n\n"
+                                "1. Ingresa a https://correo.serviunix.com\n"
+                                "2. Haz clic en '¿Olvidaste tu contraseña?'\n"
+                                "3. Sigue las instrucciones enviadas a tu correo alternativo.\n\n"
+                                "Si el problema persiste, indícamelo."
+                            )
+                        )
+                    ]
+                }
+                
+        
+    if step == "waiting_confirmation":
+        if "si" in last_message:
+            return{
+                "password_step":"done",
+                "messages": [
+                    AIMessage(content="Perfecto me alegra que se haya solucionado tu problema")
+                    ]
+                }
+                
+        if "no" in last_message:
+            real_data = state.get("real_data") or {}
+            profile = build_account_profile(real_data)
+            select_questions = generate_adaptive_questions(profile, QUESTION_BANK)
+
+            if len(select_questions) < 2:
+                    select_questions = select_initial_quetions()
+
+            first_question = select_questions[0]
+
+            return {
+                    "password_step": "dynamic_question",
+                    "security_questions": select_questions,
+                    "user_answers": {},
+                    "current_question_index": 0,
+                    "intent": "password_flow",
+                    "messages": [
+                        AIMessage(content=get_question_text(first_question))
+                        ]
+            }
+
+
+
+
+
+
+    if step == "dynamic_question":
+
+        questions = state.get("security_questions") or []
+        answers = state.get("user_answers") or {}
+        index = state.get("current_question_index") or 0
+
+        if not questions or index >= len(questions):
+            return {"intent": "human"}
+
+        current_question_key = questions[index]
+        answers[current_question_key] = last_message
+        next_index = index + 1
+
+        if next_index < len(questions):
+
+            next_question_key = questions[next_index]
+
+            return {
+                "password_step": "dynamic_question",
+                "security_questions": questions,
+                "user_answers": answers,
+                "current_question_index": next_index,
+                "intent": "password_flow",
+                "messages": [
+                    AIMessage(content=get_question_text(next_question_key))
+                ]
+            }
+
+        email = state.get("email")
+
+        
+        real_data = state.get("real_data", {})
+        
+        
+        score , risk_analysis = calculate_security_score(
+            answers,
+            real_data,
+            QUESTION_BANK
+        )
+        
+        print("Respuestas usuario:", answers)
+        print("Datos reales:", real_data)
+        print("Score:", score)
+        print("Análisis:", risk_analysis)
+
+        validation_summary = {
+            "tipo": "password_reset",
+            "riesgo": score,
+            "analisis_detallado": risk_analysis,
+            "respuestas_usuario": answers,
+        }
+
+
+        if score >= 70:
+            return {
+                "security_risk": score,
+                "validation_summary": validation_summary,
+                "messages": [
+                    AIMessage(
+                        content="Validación completada correctamente. Tu solicitud será procesada."
+                    )
+                ]
+            }
+
+
+        if 40 <= score < 70:
+
+            additional = select_additional_question(
+                questions,
+                state.get("real_data"),
+                QUESTION_BANK
+            )
+
+            if not additional:
+                return {
+                    "intent": "human",
+                    "security_risk": score,
+                    "validation_summary": validation_summary
+                }
+
+            
+            return {
+                "password_step": "dynamic_question",
+                "security_questions": questions + [additional],
+                "user_answers": answers,
+                "current_question_index": len(questions),
+                "security_risk": score,
+                "messages": [
+                    AIMessage(content=get_question_text(additional))
+                ]
+            }
+
+
+        return {
+            "intent": "human",
+            "security_risk": score,
+            "validation_summary": validation_summary
+        }
 
 def escalate_human(state: State):
 
@@ -675,7 +906,7 @@ def escalate_human(state: State):
         historial += f"{role}: {msg.content}\n"
 
     
-    chatwoot_base_url = os.environ.get("https://app.chatwoot.com")
+    chatwoot_base_url = os.environ.get("CHATWOOT_URL")
     chatwoot_link = f"{chatwoot_base_url}/app/accounts/1/conversations/{thread_id}"
 
     
@@ -728,22 +959,30 @@ def silence(state: State):
     return {"messages": []}
 
 
+def normalize(text: str):
+    """"
+    Limpia texto para comparacion:
+    - minusculas 
+    - sin espacios extras
+    - sin caracteres especiales
+    """
+    
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9áéíóúñ]', '', text)
+    return text
+
+
 
 
 builder = StateGraph(State)
-
 builder.add_node("router", router)
 builder.add_node("chat_general", chat_general)
 builder.add_node("create_ticket", create_ticket)
 builder.add_node("check_status_ticket", check_status_ticket)
 builder.add_node("escalate_human", escalate_human)
 builder.add_node("handle_password_issue", handle_password_issue)
-
-
 builder.add_node("silence", silence)
-
 builder.add_edge(START, "router")
-
 builder.add_conditional_edges(
     "router",
     lambda state: state["intent"],
@@ -770,12 +1009,6 @@ builder.add_conditional_edges(
 
 builder.add_edge("create_ticket", END)
 builder.add_edge("check_status_ticket", END)
-
-
-
-
-
 builder.add_edge("escalate_human", END)
 builder.add_edge("silence", END)
-
 graph = builder.compile(checkpointer=memory_saver)
