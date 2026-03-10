@@ -1,4 +1,4 @@
-from sqlalchemy import Table, Column, Integer, String, DateTime, INT
+from sqlalchemy import Table, Column, Integer, String, DateTime, INT, Text
 from sqlalchemy.sql import func
 from config.db import engine, meta_data
 
@@ -12,6 +12,7 @@ users = Table(
     Column("name", String(20), nullable=False),
     Column("company", String(40), nullable=False),
     Column("email", String(200), nullable=False, unique=True),
+    Column("sede", Text, nullable=False),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
     extend_existing=True
 )

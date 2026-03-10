@@ -2,6 +2,9 @@ from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI
 from router.router import user, chat, whatssap_router
+from graph.graph import init_llm_with_tools
+
+
 
 app = FastAPI()
 
