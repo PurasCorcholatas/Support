@@ -9,6 +9,11 @@ from graph.graph import init_llm_with_tools
 app = FastAPI()
 
 
+@app.on_event("startup")
+async def startup():
+    await init_llm_with_tools()
+
+
 app.include_router(user, prefix="/api")
 app.include_router(chat, prefix="/chat")
 app.include_router(whatssap_router)

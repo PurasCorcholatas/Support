@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
-
+from langgraph.prebuilt import ToolNode
 
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,7 +16,7 @@ from config.db import SessionLocal
 from models.users import users
 from models.conversations import conversation
 from models.messages import messages
-from models.tickets import tickets
+
 from services.mcp_client import get_mcp_tools
 
 
@@ -44,25 +44,110 @@ load_dotenv()
 
 memory_saver = MemorySaver()
 
+
+llm = ChatOpenAI(
+    model="gpt-4.1-mini",
+    temperature=0,
+    
+)
+
+llm_with_tools = None
+tool_node = None
+graph = None
+tools = []
+
 async def init_llm_with_tools():
+
+    global llm_with_tools
+    global tool_node
+    global graph
+    global tools
 
     tools = await get_mcp_tools()
 
     llm_with_tools = llm.bind_tools(tools)
 
-    return llm_with_tools
+    tool_node = ToolNode(tools)
 
+    
+    new_builder = StateGraph(State)
 
-llm = ChatOpenAI(
-    model="gpt-4.1",
-    temperature=0,
-)
+    new_builder.add_node("router", router)
+    new_builder.add_node("chat_general", chat_general)
+    new_builder.add_node("greeting_flow", greeting_flow)
+    new_builder.add_node("diagnosis_flow", diagnosis_flow)
+    new_builder.add_node("support_options", offer_support_options)
+    new_builder.add_node("support_agent", support_agent)
+    new_builder.add_node("escalate_human", escalate_human)
+    new_builder.add_node("handle_password_issue", handle_password_issue)
+    new_builder.add_node("silence", silence)
+    new_builder.add_node("tools", tool_node)
 
+    new_builder.add_edge(START, "router")
 
+    new_builder.add_conditional_edges(
+        "router",
+        lambda state: state["intent"],
+        {
+            "greeting_flow": "greeting_flow",
+            "chat_general": "chat_general",
+            "human": "escalate_human",
+            "password_flow": "handle_password_issue",
+            "silence": "silence",
+            "diagnosis_flow": "diagnosis_flow",
+            "support_options": "support_options",
+            "crear_ticket": "support_agent"
+        }
+    )
 
+    new_builder.add_conditional_edges(
+        "handle_password_issue",
+        lambda state: state.get("intent", "chat_general"),
+        {
+            "human": "escalate_human",
+            "chat_general": END,
+            "password_flow": END,
+        }
+    )
 
+    new_builder.add_conditional_edges(
+        "support_options",
+        lambda state: state.get("intent", "support_options"),
+        {
+            "crear_ticket": "support_agent",
+            "human": "escalate_human",
+            "support_options": END,
+            "chat_general": END,
+        }
+    )
+
+    new_builder.add_conditional_edges(
+        "support_agent",
+        lambda state: "tools" if getattr(state["messages"][-1], "tool_calls", None) else END,
+        {
+            "tools": "tools",
+            END: END
+        }
+    )
+
+    new_builder.add_edge("tools", END)
+    new_builder.add_edge("diagnosis_flow", END)
+    new_builder.add_edge("greeting_flow", END)
+    new_builder.add_edge("escalate_human", END)
+    new_builder.add_edge("silence", END)
+    new_builder.add_edge("chat_general", END)
+
+    graph = new_builder.compile(checkpointer=memory_saver)
+
+    print("Graph inicializado correctamente")
+    
 
 class State(TypedDict, total=False):
+    
+    
+
+  
+    
     messages: Annotated[List[BaseMessage], add_messages]
     intent: Literal[
         "chat_general",
@@ -97,6 +182,7 @@ class State(TypedDict, total=False):
     
     support_option_step: Optional[Literal[
         "offer_options",
+        "waiting_choice"
 
     ]]
     
@@ -138,8 +224,14 @@ class State(TypedDict, total=False):
     email: Optional[str]
     validation_summary: Optional[dict]
 
+
+
+builder = StateGraph(State) 
    
-def langgraph(mensaje: str, thread_id: str):
+async def langgraph(mensaje: str, thread_id: str):
+
+    if graph is None:
+        raise Exception("Graph no inicializado")
 
     db = SessionLocal()
 
@@ -150,12 +242,22 @@ def langgraph(mensaje: str, thread_id: str):
         "conversation_status": "bot_active"
     }
 
-    result = graph.invoke(
+    result = await graph.ainvoke(
         state,
-        config={"configurable": {"thread_id": thread_id}}
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 200
+        }
     )
 
-    final_message = result["messages"][-1].content
+    raw = result["messages"][-1].content
+
+    if isinstance(raw, list):
+        final_message = " ".join(
+            block.get("text", "") for block in raw if isinstance(block, dict)
+        ).strip()
+    else:
+        final_message = str(raw)
 
     
     stmt_user = select(users).where(users.c.phone_number == thread_id)
@@ -232,138 +334,87 @@ def greeting_flow(state: State):
     name = user.name if user and user.name else ""
     sede = user.sede if user and user.sede else None
 
-
-    
     if step == "start":
-
         prompt = f"""
-        El usuario se llama {name}.
-
-        El usuario acaba de decir:
-        "{last_user_message}"
-
-        Respóndele el saludo de forma natural y pregúntale cómo está.
-        No preguntes aún por la sede.
+        El usuario se llama {name} y acaba de decir: "{last_user_message}"
+        Respóndele el saludo de forma cordial y humana. Nada más.
         """
-
         return {
             "greeting_step": "wait_user_reply",
             "messages": [conversational_response(prompt)]
         }
 
-
-    
     elif step == "wait_user_reply":
-
+        # El usuario respondió al saludo, ahora pregunta la sede
         if sede:
-
             prompt = f"""
             El usuario respondió: "{last_user_message}"
-
-            Respóndele de forma amable y pregúntale si se encuentra en la sede {sede}.
+            Respóndele brevemente y pregúntale si se encuentra en la sede {sede}.
             """
-
-            return {
-                "greeting_step": "confirm_branch",
-                "messages": [conversational_response(prompt)]
-            }
-
         else:
-
             prompt = f"""
             El usuario respondió: "{last_user_message}"
-
-            Respóndele de forma natural y pregúntale desde qué sede se comunica.
+            Respóndele brevemente y pregúntale desde qué sede se comunica.
             """
+        return {
+            "greeting_step": "confirm_branch",
+            "messages": [conversational_response(prompt)]
+        }
 
-            return {
-                "greeting_step": "confirm_branch",
-                "messages": [conversational_response(prompt)]
-            }
-
-
-    
     elif step == "confirm_branch":
-
-        if sede and last_user_message in ["si","sí","correcto"]:
-
+        if sede and last_user_message in ["si", "sí", "correcto"]:
             prompt = f"""
             El usuario confirmó que está en la sede {sede}.
-
             Respóndele de forma natural y pregúntale en qué problema necesita ayuda.
             """
-
             return {
                 "greeting_step": "waiting_problem",
-                "messages":[conversational_response(prompt)]
+                "messages": [conversational_response(prompt)]
             }
 
-
         if "no" in last_user_message:
-
             sede_detected = extract_sede(last_user_message)
-
             if sede_detected:
-
                 db.execute(
                     update(users)
                     .where(users.c.phone_number == thread_id)
                     .values(sede=sede_detected)
                 )
                 db.commit()
-
                 prompt = f"""
-                Entendí que ahora estás en la sede {sede_detected}.
-
-                Confirma la sede y pregúntale en qué problema necesita ayuda.
+                El usuario indicó que está en la sede {sede_detected}.
+                Confírmale la sede y pregúntale en qué problema necesita ayuda.
                 """
-
                 return {
                     "greeting_step": "waiting_problem",
-                    "messages":[conversational_response(prompt)]
+                    "messages": [conversational_response(prompt)]
                 }
-
-
-            prompt = """
-            El usuario dijo que no está en la sede registrada.
-
-            Pregúntale desde qué sede se comunica.
-            """
 
             return {
                 "greeting_step": "confirm_branch",
-                "messages":[conversational_response(prompt)]
+                "messages": [conversational_response("El usuario dijo que no está en la sede registrada. Pregúntale desde qué sede se comunica.")]
             }
 
+        # El usuario mencionó una sede directamente
+        sede_detected = extract_sede(last_user_message)
+        if user and sede_detected:
+            db.execute(
+                update(users)
+                .where(users.c.phone_number == thread_id)
+                .values(sede=sede_detected)
+            )
+            db.commit()
 
-        
-    sede_detected = extract_sede(last_user_message)
-
-    if user:
-
-        db.execute(
-            update(users)
-            .where(users.c.phone_number == thread_id)
-            .values(sede=sede_detected)
-        )
-
-        db.commit()
-
-
-    prompt = f"""
-    El usuario indicó que ahora está en la sede {sede_detected}.
-
-    No le digas que actualizaste la base de datos.
-    Solo responde de forma natural y pregúntale en qué problema necesita ayuda.
-    """
-
-    return {
+        prompt = f"""
+        El usuario indicó que está en la sede {sede_detected}.
+        No menciones la base de datos. Confírmale y pregúntale en qué problema necesita ayuda.
+        """
+        return {
             "greeting_step": "waiting_problem",
             "messages": [conversational_response(prompt)]
-    }
+        }
 
     return {}
-
         
     
     
@@ -389,141 +440,118 @@ Responde corto y natural.
 
     return AIMessage(content=response.content)
     
-def diagnosis_flow(state:State):
+
+def diagnosis_flow(state: State):
     
+    if llm_with_tools is None:
+        raise Exception("Graph no inicializado")
+        
     step = state.get("diagnosis_step") or 0
     history = state.get("diagnosis_history") or []
     messages_state = state.get("messages", [])
     last_user_message = str(messages_state[-1].content)
     
-    if any(word in last_user_message.lower() for word in ["ticket", "crear_ticket"]):
-        return {
-            "intent": "crear_ticket",
-            "diagnosis_step": None,
-            "support_option_step": None
-        }
-        
     history_text = "\n".join(history)
-        
-    if step >= 3:
-        severity = detected_incident_severity(history_text)
+
     
-        return{
-            "diagnosis_step": None,
-            "support_option_step":"offer_options",
-            "severity": severity,
-            "messages":[
-                AIMessage(
-                    "Con lo que me cuentas ya tengo una idea del problema. \n\n"
-                    "Podemos hacer dos cosas:\n"
-                    "1. Crear un ticket para que soporte lo revise\n"
-                    "2. Conectarte con un agente (puede tardar un poco)\n\n"
-                    "¿Que prefieres?"
-                )
-            ]
-        }
-        
-   
-        
-      
-        
-        
+    updated_history = history + [f"usuario: {last_user_message}"]
+    updated_history_text = "\n".join(updated_history)
+
+    
+    if step >= 1:
+        enough = llm.invoke([
+            SystemMessage(content="Responde SOLO con 'si' o 'no'. Sin explicaciones."),
+            HumanMessage(content=f"""
+Eres un ingeniero de soporte. Revisa este historial.
+
+HISTORIAL:
+{updated_history_text}
+
+¿Tienes suficiente información para abrir un ticket con: descripción del problema, cuándo ocurre y qué sistema está afectado?
+
+Si puedes responder al menos 2 de esas 3 cosas con el historial, responde 'si'.
+Si no, responde 'no'.
+
+Responde SOLO: si / no
+""")
+        ])
+
+        tiene_suficiente = "si" in str(enough.content).strip().lower()
+
+        if tiene_suficiente or step >= 5:
+            severity = detected_incident_severity(updated_history_text)
+            return {
+                "diagnosis_step": None,
+                "support_option_step": "waiting_choice",
+                "severity": severity,
+                "diagnosis_history": updated_history,
+                "messages": [
+                    AIMessage(
+                        content=
+                        "Con lo que me cuentas ya tengo una idea del problema.\n\n"
+                        "Podemos hacer dos cosas:\n"
+                        "1. Crear un ticket para que soporte lo revise\n"
+                        "2. Conectarte con un agente (puede tardar un poco)\n\n"
+                        "¿Qué prefieres?"
+                    )
+                ]
+            }
+
     prompt = f"""
-        Eres un ingeniero senior de soporte técnico con mucha experiencia diagnosticando problemas en sistemas reales.
+Eres un ingeniero senior de soporte técnico con mucha experiencia diagnosticando problemas en sistemas reales.
 
-        Tu estilo debe ser:
-        - natural
-        - técnico
-        - conversacional
-        - como un ingeniero de soporte real hablando con un usuario
+Tu estilo debe ser:
+- natural
+- técnico
+- conversacional
+- como un ingeniero de soporte real hablando con un usuario
 
-        Tu objetivo NO es resolver el problema directamente.
-        Tu trabajo es INVESTIGAR el problema haciendo preguntas técnicas inteligentes.
+Tu objetivo NO es resolver el problema directamente.
+Tu trabajo es INVESTIGAR el problema haciendo preguntas técnicas inteligentes.
 
-        Debes recopilar información suficiente para que otro ingeniero pueda resolver el problema.
+PROBLEMA ORIGINAL (historial de la conversación)
+{updated_history_text}
 
-        
+INSTRUCCIONES IMPORTANTES
+Analiza cuidadosamente lo que dijo el usuario.
 
-        PROBLEMA ORIGINAL (historial de la conversación)
+Si el usuario ya mencionó:
+- un error
+- un mensaje del sistema
+- un log
+- un comportamiento específico
 
-        {history_text}
+NO vuelvas a preguntar lo mismo.
 
-        
+Tu pregunta debe ayudar a identificar:
+- dónde ocurre el problema
+- cuándo ocurre
+- qué sistema está involucrado
+- qué acción lo dispara
+- qué error aparece
 
-        ÚLTIMO MENSAJE DEL USUARIO
+REGLAS IMPORTANTES
+- Haz SOLO UNA pregunta
+- La pregunta debe ser clara y técnica
+- No hagas preguntas genéricas como "¿puedes explicar mejor?"
+- No repitas preguntas anteriores
+- Máximo 20 palabras
+- Responde SOLO con la pregunta
+"""
 
-        {last_user_message}
-
-        
-
-        INSTRUCCIONES IMPORTANTES
-
-        Analiza cuidadosamente lo que dijo el usuario.
-
-        Si el usuario ya mencionó:
-        - un error
-        - un mensaje del sistema
-        - un log
-        - un comportamiento específico
-
-        NO vuelvas a preguntar lo mismo.
-
-        Si el usuario ya dio información técnica,
-        haz una pregunta que profundice más en el problema.
-
-        Piensa como un ingeniero investigando un incidente real.
-
-        Tu pregunta debe ayudar a identificar:
-
-        - dónde ocurre el problema
-        - cuándo ocurre
-        - qué sistema está involucrado
-        - qué acción lo dispara
-        - qué error aparece
-
-        
-
-        EJEMPLOS DE BUENAS PREGUNTAS
-
-        Usuario: "sale error 500"
-        Bot: "¿Ese error aparece al iniciar sesión o al cargar alguna página específica?"
-
-        Usuario: "no responde por ssh"
-        Bot: "¿El servidor responde a ping desde tu red?"
-
-        Usuario: "sale authentication failed"
-        Bot: "¿Ese error aparece al acceder al correo o al panel administrativo?"
-
-        Usuario: "la caja no abre"
-        Bot: "¿La caja muestra algún mensaje de error en el sistema POS?"
-
-        
-
-        REGLAS IMPORTANTES
-
-        - Haz SOLO UNA pregunta
-        - La pregunta debe ser clara y técnica
-        - No hagas preguntas genéricas como "¿puedes explicar mejor?"
-        - No repitas preguntas anteriores
-        - Máximo 20 palabras
-        - Responde SOLO con la pregunta
-        """
-    
     response = llm.invoke([
         SystemMessage(content="Eres un ingeniero de soporte experto y experimentado"),
-            HumanMessage(content=prompt)
+        HumanMessage(content=prompt)
     ])
-    
+
     question = str(getattr(response, "content", response)).strip()
-        
-    return{
+
+    return {
         "diagnosis_step": step + 1,
-        "diagnosis_history": history + [
-            f"usuario: {last_user_message}",
-            f"bot: {question}"
-        ],
+        "diagnosis_history": updated_history + [f"bot: {question}"],
         "messages": [AIMessage(content=question)]
     }
+
 
 def offer_support_options(state:State):
     
@@ -547,7 +575,13 @@ def offer_support_options(state:State):
             ]
         }
         
-    if "ticket" in last or "1" in last:
+    
+    if (
+        "ticket" in last
+        or "1" in last
+        or "crear ticket" in last
+        or "zammad" in last
+    ):
         return {
             "intent": "crear_ticket",
             "support_option_step": None,
@@ -561,11 +595,14 @@ def offer_support_options(state:State):
             "diagnosis_step": None
         }
 
-    return{
+    return {
         "support_option_step": "waiting_choice",
-        "messages":[
+        "messages": [
             AIMessage(
-                content="Puedes elegir crear ticket o hablar con un agente"
+                content=(
+                    "No te entendí bien.\n\n"
+                    "Responde **1** para crear un ticket o **2** para hablar con un agente humano."
+                )
             )
         ]
     }
@@ -629,82 +666,191 @@ def detected_incident_severity(history_text):
     return str(response.content).strip().lower()
 
 
-def router(state: State):
+async def support_agent(state):
+
+    if llm_with_tools is None:
+        raise Exception("LLM no inicializado")
+
+    history = state.get("diagnosis_history", [])
+    severity = state.get("severity", "media")
+    thread_id = state.get("thread_id")
+
+    title, description = generate_ticket_summary(history, severity)
 
     
+    create_tool = next(
+        (t for t in tools if t.name == "zammad_create_ticket"),
+        None
+    )
+
+    if create_tool is None:
+        return {
+            "intent": "human",
+            "messages": [AIMessage(content="No pude crear el ticket. Te conecto con un agente.")]
+        }
+
+    
+    db = SessionLocal()
+    stmt_user = select(users).where(users.c.phone_number == thread_id)
+    user = db.execute(stmt_user).fetchone()
+
+    if user:
+        user_info = f"""
+Informacion del usuario
+
+Nombre: {user.name or 'No registrado'}
+Empresa: {user.company or 'No registrada'}
+Correo: {user.email or 'No disponible'}
+Teléfono: {thread_id}
+Sede: {user.sede or 'No registrada'}
+
+Diagnostico del problema
+
+{description}
+"""
+    else:
+        user_info = description
+
+    customer = user.email if user and user.email else "simon.restrepo@serviunix.com"
+
+    result = await create_tool.ainvoke({
+        "params": {
+            "title": title,
+            "group": "Users",
+            "customer": customer,
+            "article_body": user_info,
+        }
+    })
+
+    print("Resultado create_ticket:", result)
+
+    return {
+        "messages": [
+            AIMessage(content=f"Ticket creado exitosamente.\n\nTítulo: {title}")
+        ],
+        "intent": "chat_general",
+        "support_option_step": None,
+        "diagnosis_step": None,
+        "diagnosis_history": None,
+        "severity": None
+    }
+    
+def generate_ticket_summary(history, severity):
+
+    history_text = "\n".join(history)
+
+    prompt = f"""
+Eres un ingeniero de soporte senior.
+
+Convierte este diagnóstico en un ticket profesional.
+
+DIAGNOSTICO
+{history_text}
+
+SEVERIDAD
+{severity}
+
+Devuelve EXACTAMENTE en este formato:
+
+TITULO: ...
+DESCRIPCION: ...
+"""
+
+    response = llm.invoke([
+        SystemMessage(content="Eres un ingeniero de soporte experto."),
+        HumanMessage(content=prompt)
+    ])
+
+    text = str(response.content or "")
+
+    title = "Incidente reportado por usuario"
+    description = text
+
+    if "TITULO:" in text and "DESCRIPCION:" in text:
+        try:
+            title = text.split("TITULO:")[1].split("DESCRIPCION:")[0].strip()
+            description = text.split("DESCRIPCION:")[1].strip()
+        except:
+            pass
+
+    return title, description
+        
+        
+        
+def should_use_tool(state):
+    
+    last = state["messages"][-1]
+    
+    if hasattr(last,"tool_calls") and last.tool_calls:
+        return "tools"
+    
+    return "end"
+
+def router(state: State):
+
     if state.get("conversation_status") == "human_active":
         return {"intent": "silence"}
 
     if state.get("password_step"):
         return {"intent": "password_flow"}
 
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+    user_text = str(last_message.content).lower() if last_message else ""
+
+    
+    if state.get("support_option_step") == "waiting_choice":
+        if "ticket" in user_text or "1" in user_text or "crear ticket" in user_text:
+            return {
+                "intent": "crear_ticket",
+                "support_option_step": None,
+                "diagnosis_step": None,
+            }
+        if "agente" in user_text or "humano" in user_text or "2" in user_text:
+            return {
+                "intent": "human",
+                "support_option_step": None,
+                "diagnosis_step": None,
+            }
+        return {"intent": "support_options"}
+
     greeting_step = state.get("greeting_step")
-        
+
     if greeting_step and greeting_step != "waiting_problem":
         return {"intent": "greeting_flow"}
-    
-    if greeting_step == "waiting_problem" and not state.get("diagnosis_step"):
-        
-        messages = state.get("messages", [])
-        last_message = messages[-1] if messages else None
+
+    if greeting_step == "waiting_problem" and state.get("diagnosis_step") is None:
         last = messages[-1].content if messages else ""
         return {
             "intent": "diagnosis_flow",
             "diagnosis_step": 0,
-            "diagnosis_history":[
-                f"problema inicial del usuario: {last}"
-            ]
+            "diagnosis_history": [f"problema inicial del usuario: {last}"]
         }
-        
-    
-
-    messages = state.get("messages", [])
 
     if not state.get("greeting_step") and len(messages) == 1:
         return {
             "intent": "greeting_flow",
             "greeting_step": "start"
         }
-        
-    if state.get("support_option_step"):
-        return{"intent": "support_options"}
 
-    
-    
+    if state.get("support_option_step"):
+        return {"intent": "support_options"}
+
     if state.get("diagnosis_step") is not None:
-        return{"intent": "diagnosis_flow"}
-    
-    
-  
-    last_message = state.get("messages", [])[-1]
-    user_text = str(last_message.content).lower() if last_message else ""
+        return {"intent": "diagnosis_flow"}
 
     password_keywords = [
-        "contraseña",
-        "clave",
-        "password",
-        "no puedo entrar",
-        "no puedo ingresar",
-        "error autenticacion",
-        "error autenticación",
-        "correo no funciona",
-        "no funciona mi correo",
-        "problema de acceso",
-        "no puedo acceder al correo"
+        "contraseña", "clave", "password", "no puedo entrar",
+        "no puedo ingresar", "error autenticacion", "error autenticación",
+        "correo no funciona", "no funciona mi correo",
+        "problema de acceso", "no puedo acceder al correo"
     ]
 
-    
     if any(word in user_text for word in password_keywords):
-
         if not state.get("password_step"):
-            return {
-                "intent": "password_flow",
-                "password_step": "confirmation_continue"
-            }
-
+            return {"intent": "password_flow", "password_step": "confirmation_continue"}
         return {"intent": "password_flow"}
 
-    
     if state.get("ticket_step"):
         return {"intent": "crear_ticket"}
 
@@ -712,39 +858,17 @@ def router(state: State):
         return {"intent": "estado_ticket"}
 
     if "ticket" in user_text and "estado" in user_text:
-        return {
-            "intent": "estado_ticket",
-            "ticket_status_step": "ask_id"
-        }
+        return {"intent": "estado_ticket", "ticket_status_step": "ask_id"}
 
     if "ticket" in user_text:
         return {"intent": "crear_ticket"}
 
     if "humano" in user_text or "agente" in user_text:
         return {"intent": "human"}
-    prompt = f"""
-Clasifica el mensaje:
 
-"{user_text}"
-
-Opciones:
-- password_flow
-- crear_ticket
-- estado_ticket
-- human
-- chat_general
-
-Responde solo una palabra.
-"""
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    intent = str(response.content).strip().lower().split()[0]
-
-    return {
-        "intent": intent,
-        "conversation_status": "bot_active"
-    }
-
+    return {"intent": "chat_general", "conversation_status": "bot_active"}
+    
+    
 def chat_general(state: State, config):
 
     system_prompt = """
@@ -1200,44 +1324,71 @@ def reset_password_flow():
     }
 
 
-builder = StateGraph(State)
-builder.add_node("router", router)
-builder.add_node("chat_general", chat_general)
-builder.add_node("greeting_flow", greeting_flow)
-builder.add_node("diagnosis_flow", diagnosis_flow)
-builder.add_node("support_options", offer_support_options)
-builder.add_node("escalate_human", escalate_human)
-builder.add_node("handle_password_issue", handle_password_issue)
-builder.add_node("silence", silence)
-builder.add_edge(START, "router")
-builder.add_conditional_edges(
-    "router",
-    lambda state: state["intent"],
-    {
-        "greeting_flow": "greeting_flow",
-        "chat_general": "chat_general",
-        "human": "escalate_human",
-        "password_flow": "handle_password_issue",
-        "silence": "silence",
-        "diagnosis_flow": "diagnosis_flow",
-        "support_options": "support_options"
+# builder.add_node("tools", lambda state: state)  
+
+# builder.add_edge("tools", END)
+
+# builder.add_conditional_edges(
+#     "support_agent",
+#     lambda state: "tools" if getattr(state["messages"][-1], "tool_calls", None) else END,
+#     {
+#         "tools": "tools",
+#         END: END
+#     }
+# )
+
+# builder.add_node("router", router)
+# builder.add_node("chat_general", chat_general)
+# builder.add_node("greeting_flow", greeting_flow)
+# builder.add_node("diagnosis_flow", diagnosis_flow)
+# builder.add_node("support_options", offer_support_options)
+# builder.add_node("support_agent", support_agent)
+# builder.add_node("escalate_human", escalate_human)
+# builder.add_node("handle_password_issue", handle_password_issue)
+# builder.add_node("silence", silence)
+# builder.add_edge(START, "router")
+# builder.add_conditional_edges(
+#     "router",
+#     lambda state: state["intent"],
+#     {
+#         "greeting_flow": "greeting_flow",
+#         "chat_general": "chat_general",
+#         "human": "escalate_human",
+#         "password_flow": "handle_password_issue",
+#         "silence": "silence",
+#         "diagnosis_flow": "diagnosis_flow",
+#         "support_options": "support_options",
+#         "crear_ticket": "support_agent"
         
-    }
-)
+        
+#     }
+# )
 
-builder.add_conditional_edges(
-    "handle_password_issue",
-    lambda state: state.get("intent", "chat_general"),
-    {
+# builder.add_conditional_edges(
+#     "handle_password_issue",
+#     lambda state: state.get("intent", "chat_general"),
+#     {
     
-        "human": "escalate_human",
-        "chat_general": END,
-        "password_flow": END,
-    }
-)
+#         "human": "escalate_human",
+#         "chat_general": END,
+#         "password_flow": END,
+#     }
+# )
 
-builder.add_edge("greeting_flow", END)
-builder.add_edge("check_status_ticket", END)
-builder.add_edge("escalate_human", END)
-builder.add_edge("silence", END)
-graph = builder.compile(checkpointer=memory_saver)
+
+# builder.add_conditional_edges(
+#     "support_options",
+#     lambda state: state.get("intent", "support_options"),
+#     {
+#         "crear_ticket": "support_agent",
+#         "human": "escalate_human",
+#         "support_options": END,
+#         "chat_general": END,
+#     }
+# )
+
+# builder.add_edge("support_agent", END)  
+# builder.add_edge("diagnosis_flow", END)
+# builder.add_edge("greeting_flow", END)
+# builder.add_edge("escalate_human", END)
+# builder.add_edge("silence", END)

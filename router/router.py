@@ -2,7 +2,8 @@ from config.db import engine, get_db
 from fastapi import APIRouter , Depends , Request
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from graph.graph import graph, State, langgraph
+from graph.graph import  State, langgraph
+import graph.graph as graph_module
 from langchain_core.messages import HumanMessage
 import os
 import requests
@@ -34,7 +35,7 @@ def root():
 
 @chat.post("/webhook/chatwoot")
 async def chat_whatsapp_webhook(request: Request):
-    print("🔥🔥 WEBHOOK RECIBIDO 🔥🔥")
+    print(" WEBHOOK RECIBIDO ")
     return {"status": "ok"}
 
 
@@ -46,7 +47,7 @@ def chat_endopoint( payload: ChatRequest):
     "intent": "chat_general"
 }
     
-    result = graph.invoke(
+    result = graph_module.graph.invoke(
         state,
         config = {"configurable": {"thread_id": str(user_id)}}
     )    
@@ -78,7 +79,7 @@ async def chat_webhook(request: Request):
     if not message or not conversation_id:
         return {"status": "missing data"}
 
-    respuesta = langgraph(message, str(conversation_id))
+    respuesta = await langgraph(message, str(conversation_id))
 
     url = f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages"
 

@@ -1,7 +1,7 @@
 import requests
 
 ZAMMAD_URL = "https://supportserviunix.zammad.com/api/v1"
-ZAMMAD_TOKEN = "SHvYIyAGum3nVE_WC_9BhZuKa4zDfCSgAlums879U6HMgUOSMKsVxwoe2s4Y2Hon"
+ZAMMAD_TOKEN = "ZPhxdNvhTvWX9lFejDsJcjdDgJIULoMnLtjl9ZmuV5BmOaTdMPkW8OL-YpGqZBQw"
 
 
 class ZammadService:
