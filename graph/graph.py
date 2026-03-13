@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from sqlalchemy import select, insert, update
 import re
+import json 
 
 from config.db import SessionLocal
 from models.users import users
@@ -34,7 +35,7 @@ from security.question_engine import (
 from security.scoring_engine import calculate_security_score
 
 from services.zimbra_service import ZimbraService
-from services.zammad_services import ZammadService
+
 
 import smtplib
 from email.mime.text import MIMEText
@@ -70,22 +71,22 @@ async def init_llm_with_tools():
     tool_node = ToolNode(tools)
 
     
-    new_builder = StateGraph(State)
+    builder = StateGraph(State)
 
-    new_builder.add_node("router", router)
-    new_builder.add_node("chat_general", chat_general)
-    new_builder.add_node("greeting_flow", greeting_flow)
-    new_builder.add_node("diagnosis_flow", diagnosis_flow)
-    new_builder.add_node("support_options", offer_support_options)
-    new_builder.add_node("support_agent", support_agent)
-    new_builder.add_node("escalate_human", escalate_human)
-    new_builder.add_node("handle_password_issue", handle_password_issue)
-    new_builder.add_node("silence", silence)
-    new_builder.add_node("tools", tool_node)
+    builder.add_node("router", router)
+    builder.add_node("chat_general", chat_general)
+    builder.add_node("greeting_flow", greeting_flow)
+    builder.add_node("diagnosis_flow", diagnosis_flow)
+    builder.add_node("support_options", offer_support_options)
+    builder.add_node("support_agent", support_agent)
+    builder.add_node("check_ticket_status",check_ticket_status)
+    builder.add_node("escalate_human", escalate_human)
+    builder.add_node("handle_password_issue", handle_password_issue)
+    builder.add_node("tools", tool_node)
 
-    new_builder.add_edge(START, "router")
+    builder.add_edge(START, "router")
 
-    new_builder.add_conditional_edges(
+    builder.add_conditional_edges(
         "router",
         lambda state: state["intent"],
         {
@@ -93,14 +94,14 @@ async def init_llm_with_tools():
             "chat_general": "chat_general",
             "human": "escalate_human",
             "password_flow": "handle_password_issue",
-            "silence": "silence",
             "diagnosis_flow": "diagnosis_flow",
             "support_options": "support_options",
-            "crear_ticket": "support_agent"
+            "crear_ticket": "support_agent",
+            "estado_ticket": "check_ticket_status"
         }
     )
 
-    new_builder.add_conditional_edges(
+    builder.add_conditional_edges(
         "handle_password_issue",
         lambda state: state.get("intent", "chat_general"),
         {
@@ -110,7 +111,7 @@ async def init_llm_with_tools():
         }
     )
 
-    new_builder.add_conditional_edges(
+    builder.add_conditional_edges(
         "support_options",
         lambda state: state.get("intent", "support_options"),
         {
@@ -121,7 +122,7 @@ async def init_llm_with_tools():
         }
     )
 
-    new_builder.add_conditional_edges(
+    builder.add_conditional_edges(
         "support_agent",
         lambda state: "tools" if getattr(state["messages"][-1], "tool_calls", None) else END,
         {
@@ -130,30 +131,25 @@ async def init_llm_with_tools():
         }
     )
 
-    new_builder.add_edge("tools", END)
-    new_builder.add_edge("diagnosis_flow", END)
-    new_builder.add_edge("greeting_flow", END)
-    new_builder.add_edge("escalate_human", END)
-    new_builder.add_edge("silence", END)
-    new_builder.add_edge("chat_general", END)
+    builder.add_edge("tools", END)
+    builder.add_edge("diagnosis_flow", END)
+    builder.add_edge("greeting_flow", END)
+    builder.add_edge("check_ticket_status", END)
+    builder.add_edge("escalate_human", END)
+    builder.add_edge("chat_general", END)
 
-    graph = new_builder.compile(checkpointer=memory_saver)
+    graph = builder.compile(checkpointer=memory_saver)
 
     print("Graph inicializado correctamente")
     
 
 class State(TypedDict, total=False):
     
-    
-
-  
-    
     messages: Annotated[List[BaseMessage], add_messages]
     intent: Literal[
         "chat_general",
         "crear_ticket",
         "human",
-        "silence",
         "estado_ticket",
         "password_flow",
         "greeting_flow"]
@@ -169,11 +165,6 @@ class State(TypedDict, total=False):
     
     branch: Optional[str]
     
-    conversation_status: Optional[Literal[
-        "bot_active",
-        "human_active",
-        "closed"
-    ]]
     
     diagnosis_step: Optional[int]
     diagnosis_history: Optional[List[str]]
@@ -239,7 +230,7 @@ async def langgraph(mensaje: str, thread_id: str):
         "messages": [HumanMessage(content=mensaje)],
         "intent": "chat_general",
         "thread_id": thread_id,
-        "conversation_status": "bot_active"
+        
     }
 
     result = await graph.ainvoke(
@@ -345,7 +336,7 @@ def greeting_flow(state: State):
         }
 
     elif step == "wait_user_reply":
-        # El usuario respondió al saludo, ahora pregunta la sede
+        
         if sede:
             prompt = f"""
             El usuario respondió: "{last_user_message}"
@@ -395,7 +386,7 @@ def greeting_flow(state: State):
                 "messages": [conversational_response("El usuario dijo que no está en la sede registrada. Pregúntale desde qué sede se comunica.")]
             }
 
-        # El usuario mencionó una sede directamente
+        
         sede_detected = extract_sede(last_user_message)
         if user and sede_detected:
             db.execute(
@@ -714,19 +705,44 @@ Diagnostico del problema
     customer = user.email if user and user.email else "simon.restrepo@serviunix.com"
 
     result = await create_tool.ainvoke({
-        "params": {
-            "title": title,
-            "group": "Users",
-            "customer": customer,
-            "article_body": user_info,
-        }
-    })
-
+            "params": {
+                "title": title,
+                "group": "Users",
+                "customer": customer,
+                "article_body": user_info,
+            }
+        })
+        
     print("Resultado create_ticket:", result)
-
+        
+    ticket_number = "N/A"
+        
+    if isinstance(result, list) and len(result) > 0:
+        import json
+        text = result[0].get("text", "")
+        try:
+            data = json.loads(text)
+            ticket_number = data.get("number", "N/A")
+        except:
+            match = re.search(r'"number":\s*"(\d+)"', text)
+            if match:
+                ticket_number = match.group(1)
+    
+    elif isinstance(result, str):
+        match = re.search(r'"number":\s*"(\d+)"', result)
+        if match:
+            ticket_number = match.group(1)
+    elif isinstance(result, dict):
+        ticket_number = result.get("number", "N/A")
+        
     return {
         "messages": [
-            AIMessage(content=f"Ticket creado exitosamente.\n\nTítulo: {title}")
+            AIMessage(content=
+                f"Ticket creado exitosamente\n\n"
+                f"Titulo: {title}\n"
+                f"ID de ticket: #{ticket_number}\n\n"
+                f"Con ese ID puedes hacer seguimiento a tu caso."
+            )
         ],
         "intent": "chat_general",
         "support_option_step": None,
@@ -734,6 +750,8 @@ Diagnostico del problema
         "diagnosis_history": None,
         "severity": None
     }
+        
+        
     
 def generate_ticket_summary(history, severity):
 
@@ -786,17 +804,134 @@ def should_use_tool(state):
     
     return "end"
 
+
+async def check_ticket_status(state: State):
+    
+    messages_state = state.get("messages", [])
+    last_message = str(messages_state[-1].content).strip()
+    step = state.get("ticket_status_step")
+    
+    if step == "ask_id":
+        
+        match = re.search(r'\d+', last_message)
+        
+        if not match:
+            return {
+                "ticket_status_step": "ask_id",
+                "messages": [
+                    AIMessage(
+                        content="No encontre un numero en tu mensaje, ¿Puedes indicarme el numero del ticket)"
+                    )
+                ]
+            }
+
+        ticket_number = match.group(0)
+        
+        search_tool = next(
+            (t for t in tools if t.name == "zammad_search_tickets"),
+            None
+        )
+        
+        if search_tool is None:
+            return{
+                "ticket_status_step": None,
+                "messages":[
+                    AIMessage(
+                        content="No pude consultar el estado del ticket"
+                    )
+                ]
+            }
+        
+        result =await search_tool.ainvoke({
+            "params": {
+                "query": ticket_number
+            }
+        })
+        
+        print("Resultado busqueda:", result)
+        
+        ticket_info = "No encontre informacion sobre ese ticket"
+        
+        if isinstance(result, list) and len(result) > 0:
+            text = result[0].get("text", "")
+            print("Texto crudo:", repr(text))
+            
+            number_match = re.search(r'Ticket #(\d+)', text)
+            title_match = re.search(r'##\s*Ticket #\d+ - (.*)', text)
+            state_match = re.search(r'\*\*State\*\*:\s*(.+)', text)
+            
+            estados ={
+                "new":"Nuevo",
+                "open":"Abierto",
+                "closed":"Cerrado",
+                "pendind reminder": "Pendiente",
+                "merged": "Fusionado"
+            }
+            
+            if number_match:
+                estado_raw = state_match.group(1).strip().lower() if state_match else ""
+                estado_es = estados.get(estado_raw, estado_raw.capitalize() if estado_raw else "N/A")        
+
+                ticket_info = (
+                    f"Ticket: {number_match.group(1)}\n"
+                    f"Titulo: {title_match.group(1).strip() if title_match else 'N/A'}\n"
+                    f"Estado: {estado_es}"
+                )
+            
+            else:
+                ticket_info = text[:300] if text else "No pude leer la respuesta"
+
+        return{
+            "ticket_status_step": None,
+            "messages":[
+                AIMessage(
+                    content=f"Aqui esta el estado de tu ticket:\n\n{ticket_info}"
+                )
+            ]
+        }
+    
+    return{
+        "ticket_status_step": "ask_id",
+        "messages":[
+            AIMessage(
+                content="¿Cual es el numero de ticket que quieres consultar"
+            )
+        ]
+    }
+
+
 def router(state: State):
 
-    if state.get("conversation_status") == "human_active":
-        return {"intent": "silence"}
-
+  
     if state.get("password_step"):
         return {"intent": "password_flow"}
 
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
     user_text = str(last_message.content).lower() if last_message else ""
+
+    
+    if state.get("ticket_status_step") == "ask_id":
+        return {"intent": "estado_ticket"}
+
+    intent_check = llm.invoke([
+        SystemMessage(content="Responde SOLO con una palabra: 'estado_ticket' o 'otro'. Sin explicaciones."),
+        HumanMessage(content=f"""
+El usuario dice: "{user_text}"
+
+¿Quiere consultar el estado o seguimiento de un ticket que ya existe?
+
+- estado_ticket: quiere saber cómo va, el estado, hacer seguimiento de un ticket existente
+- otro: cualquier otra cosa
+
+Responde SOLO con una de estas palabras.
+""")
+    ])
+
+    detected_intent = str(intent_check.content).strip().lower()
+
+    if "estado_ticket" in detected_intent:
+        return {"intent": "estado_ticket", "ticket_status_step": "ask_id"}
 
     
     if state.get("support_option_step") == "waiting_choice":
@@ -854,21 +989,11 @@ def router(state: State):
     if state.get("ticket_step"):
         return {"intent": "crear_ticket"}
 
-    if state.get("ticket_status_step") == "ask_id":
-        return {"intent": "estado_ticket"}
-
-    if "ticket" in user_text and "estado" in user_text:
-        return {"intent": "estado_ticket", "ticket_status_step": "ask_id"}
-
-    if "ticket" in user_text:
-        return {"intent": "crear_ticket"}
-
     if "humano" in user_text or "agente" in user_text:
         return {"intent": "human"}
 
-    return {"intent": "chat_general", "conversation_status": "bot_active"}
-    
-    
+    return {"intent": "chat_general"}
+
 def chat_general(state: State, config):
 
     system_prompt = """
@@ -1289,15 +1414,12 @@ Este caso requiere intervención manual.
         print("Error enviando correo:", e)
 
     return {
-    "messages": [
-        AIMessage(content="Te estoy conectando con un técnico. En breve continuará contigo.")
-    ],
-    "conversation_status": "human_active"
-}
+        "messages": [
+            AIMessage(content="Te estoy conectando con un técnico. En breve continuará contigo.")
+        ]
+    }
 
-def silence(state: State):
-    return {"messages": []}
-
+  
 
 def normalize(text: str):
     """"
@@ -1324,71 +1446,3 @@ def reset_password_flow():
     }
 
 
-# builder.add_node("tools", lambda state: state)  
-
-# builder.add_edge("tools", END)
-
-# builder.add_conditional_edges(
-#     "support_agent",
-#     lambda state: "tools" if getattr(state["messages"][-1], "tool_calls", None) else END,
-#     {
-#         "tools": "tools",
-#         END: END
-#     }
-# )
-
-# builder.add_node("router", router)
-# builder.add_node("chat_general", chat_general)
-# builder.add_node("greeting_flow", greeting_flow)
-# builder.add_node("diagnosis_flow", diagnosis_flow)
-# builder.add_node("support_options", offer_support_options)
-# builder.add_node("support_agent", support_agent)
-# builder.add_node("escalate_human", escalate_human)
-# builder.add_node("handle_password_issue", handle_password_issue)
-# builder.add_node("silence", silence)
-# builder.add_edge(START, "router")
-# builder.add_conditional_edges(
-#     "router",
-#     lambda state: state["intent"],
-#     {
-#         "greeting_flow": "greeting_flow",
-#         "chat_general": "chat_general",
-#         "human": "escalate_human",
-#         "password_flow": "handle_password_issue",
-#         "silence": "silence",
-#         "diagnosis_flow": "diagnosis_flow",
-#         "support_options": "support_options",
-#         "crear_ticket": "support_agent"
-        
-        
-#     }
-# )
-
-# builder.add_conditional_edges(
-#     "handle_password_issue",
-#     lambda state: state.get("intent", "chat_general"),
-#     {
-    
-#         "human": "escalate_human",
-#         "chat_general": END,
-#         "password_flow": END,
-#     }
-# )
-
-
-# builder.add_conditional_edges(
-#     "support_options",
-#     lambda state: state.get("intent", "support_options"),
-#     {
-#         "crear_ticket": "support_agent",
-#         "human": "escalate_human",
-#         "support_options": END,
-#         "chat_general": END,
-#     }
-# )
-
-# builder.add_edge("support_agent", END)  
-# builder.add_edge("diagnosis_flow", END)
-# builder.add_edge("greeting_flow", END)
-# builder.add_edge("escalate_human", END)
-# builder.add_edge("silence", END)

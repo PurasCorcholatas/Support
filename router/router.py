@@ -63,15 +63,18 @@ def chat_endopoint( payload: ChatRequest):
 async def chat_webhook(request: Request):
 
     data = await request.json()
-    # print(" DATA RECIBIDA:", data)
 
-    
     if data.get("event") != "message_created":
         return {"status": "ignored"}
 
-    
     if data.get("message_type") != "incoming":
         return {"status": "not incoming"}
+
+    
+    assignee = data.get("meta", {}).get("assignee")
+    if assignee is not None:
+        print("Agente humano asignado, bot en silencio")
+        return {"status": "human_active"}
 
     message = data.get("content")
     conversation_id = data.get("conversation", {}).get("id")
