@@ -222,7 +222,7 @@ async def chat_webhook(request: Request):
     content = data.get("content") or ""
     print("CONTENT:", content[:50])
     print("FULL SENDER:", json.dumps(data.get("sender", {})))
-    print("FULL CONVERSATION META:", json.dumps(data.get("conversation", {}).get("meta", {})))
+    # print("FULL CONVERSATION META:", json.dumps(data.get("conversation", {}).get("meta", {})))
     
     
  
@@ -285,6 +285,14 @@ async def chat_webhook(request: Request):
         and data.get("private") is not True
         and sender_id is not None
         and sender_email is not None):
+        
+        print(f"DEBUG sender_id={sender_id} BOT_AGENT_ID={BOT_AGENT_ID}")
+        
+        if str(sender_id) == str(BOT_AGENT_ID):
+            print("Mensaje del bot de notificaciones, ignorado")
+            return {"status": "bot_notificacion_ignored"}
+        
+        
         
         if content_preview in _bot_messages:
             _bot_messages.discard(content_preview)

@@ -6,7 +6,7 @@ LANGGRAPH_DB_URL = "postgresql://postgres:simon@localhost:5432/support_ia"
 
 engine = create_engine(
     DATABASE_URL,
-    echo=True
+    echo=False
 )
 
 SessionLocal = sessionmaker(

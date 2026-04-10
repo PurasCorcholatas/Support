@@ -2,6 +2,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
+from langchain_anthropic import ChatAnthropic
 
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -13,6 +14,7 @@ from dotenv import load_dotenv
 from sqlalchemy import select, insert, update
 import re
 import json
+import httpx
 import asyncio
 import concurrent.futures
 
@@ -44,6 +46,18 @@ import os
 
 load_dotenv()
 
+from anthropic import Anthropic
+from langchain_anthropic import ChatAnthropic
+import os
+
+os.environ["ANTHROPIC_API_KEY"] = os.environ.get("ANTHROPIC_API_KEY", "")
+
+llm_diagnosis = ChatAnthropic(
+    model_name="claude-sonnet-4-6",
+    temperature=0,
+    timeout=60,
+    stop=None,
+)
 
 llm = ChatOpenAI(
     model="gpt-4.1-mini",
@@ -57,6 +71,15 @@ tools = []
 checkpointer = None
 _db_connection = None
 
+ 
+
+PRIORIDAD_MAP = {
+    "baja":     "1 baja",
+    "moderada": "2 moderada",
+    "alta":     "3 alta",
+    "critica":  "4 critica",
+}
+
 
 class State(TypedDict, total=False):
 
@@ -68,7 +91,6 @@ class State(TypedDict, total=False):
         "crear_ticket",
         "human",
         "estado_ticket",
-        "password_flow",
         "greeting_flow"]
 
     greeting_step: Optional[Literal[
@@ -84,8 +106,7 @@ class State(TypedDict, total=False):
     ]]
 
     branch: Optional[str]
-    similar_problem: Optional[str]
-
+    servicio: Optional[str]
     diagnosis_step: Optional[int]
     diagnosis_history: Optional[List[str]]
     diagnosis_summary: Optional[str]
@@ -152,8 +173,18 @@ async def init_llm_with_tools():
     global tools
 
     tools = await get_mcp_tools()
+
+    for t in tools:
+        if t.name == "zammad_update_ticket":
+            # print("=== SCHEMA zammad_update_ticket ===")
+            # print(t.args_schema)
+            break
+
     llm_with_tools = llm.bind_tools(tools)
     tool_node = ToolNode(tools)
+
+    await load_servicio_values()
+ 
 
     builder = StateGraph(State)
 
@@ -166,7 +197,6 @@ async def init_llm_with_tools():
     builder.add_node("check_ticket_status", check_ticket_status)
     builder.add_node("escalate_human", escalate_human)
     builder.add_node("waiting_agent", waiting_agent)
-    builder.add_node("handle_password_issue", handle_password_issue)
     builder.add_node("tools", tool_node)
 
     builder.add_edge(START, "router")
@@ -178,7 +208,6 @@ async def init_llm_with_tools():
             "greeting_flow": "greeting_flow",
             "chat_general": "chat_general",
             "human": "escalate_human",
-            "password_flow": "handle_password_issue",
             "diagnosis_flow": "diagnosis_flow",
             "support_options": "support_options",
             "crear_ticket": "support_agent",
@@ -187,15 +216,6 @@ async def init_llm_with_tools():
         }
     )
 
-    builder.add_conditional_edges(
-        "handle_password_issue",
-        lambda state: state.get("intent", "chat_general"),
-        {
-            "human": "escalate_human",
-            "chat_general": END,
-            "password_flow": END,
-        }
-    )
 
     builder.add_conditional_edges(
         "support_options",
@@ -227,8 +247,9 @@ async def init_llm_with_tools():
     builder.add_edge("chat_general", END)
 
     from psycopg_pool import AsyncConnectionPool
-    global _db_connection
-    global checkpointer
+    checkpointer = None
+    _db_connection = None
+    
 
     async with AsyncPostgresSaver.from_conn_string(LANGGRAPH_DB_URL) as tmp_checkpointer:
         await tmp_checkpointer.setup()
@@ -239,12 +260,11 @@ async def init_llm_with_tools():
         open=False
     )
     await _db_connection.open()
-    checkpointer = AsyncPostgresSaver(_db_connection)  # type: ignore
+    checkpointer = AsyncPostgresSaver(_db_connection) #type: ignore
     graph = builder.compile(checkpointer=checkpointer)
 
 
 def run_async(coro):
-    """Ejecuta una coroutine en codigo sincrono en cualquier contexto."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -278,7 +298,6 @@ async def langgraph(mensaje: str, thread_id: str):
             stmt_check = select(users).where(users.c.phone_number == thread_id)
             user_check = db.execute(stmt_check).fetchone()
 
-            # Si el bot estaba inactivo, reactivarlo y preguntar por la sede
             if user_check and user_check.bot_active is False:
                 db.execute(
                     update(users)
@@ -296,7 +315,6 @@ async def langgraph(mensaje: str, thread_id: str):
             else:
                 state: State = {
                     "messages": [HumanMessage(content=mensaje_combinado)],
-                    "intent": "chat_general",
                     "thread_id": thread_id,
                 }
 
@@ -585,7 +603,6 @@ def get_valid_user_email(thread_id: str):
 
 
 def get_user_email(thread_id: str) -> Optional[str]:
-    """Retorna el email del usuario si existe, None si no."""
     db = SessionLocal()
     try:
         user = db.execute(select(users).where(users.c.phone_number == thread_id)).fetchone()
@@ -596,6 +613,85 @@ def get_user_email(thread_id: str) -> Optional[str]:
         db.close()
 
 
+async def update_chatwoot_contact(phone_number: str, name: str = "", email: str = "", company: str = ""):
+    base_url = os.environ.get("CHATWOOT_URL")
+    token = os.environ.get("CHATWOOT_API_TOKEN", "")
+    account_id = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            headers = {"api_access_token": token}
+
+            
+            search = await client.get(
+                f"{base_url}/api/v1/accounts/{account_id}/contacts/search",
+                params={"q": phone_number},
+                headers=headers,
+                timeout=10,
+            )
+            results = search.json().get("payload", [])
+            if not results:
+                print(f"Chatwoot: contacto no encontrado para {phone_number}")
+                return
+
+            contact_id = results[0]["id"]
+
+            
+            payload = {}
+            if name:
+                payload["name"] = name
+            if email:
+                payload["email"] = email
+
+            if payload:
+                await client.put(
+                    f"{base_url}/api/v1/accounts/{account_id}/contacts/{contact_id}",
+                    json=payload,
+                    headers=headers,
+                    timeout=10,
+                )
+                print(f"Chatwoot contacto actualizado para {phone_number}: {payload}")
+
+            
+            if company:
+                # Buscar si la empresa ya existe
+                company_search = await client.get(
+                    f"{base_url}/api/v1/accounts/{account_id}/companies/search",
+                    params={"q": company},
+                    headers=headers,
+                    timeout=10,
+                )
+                company_results = company_search.json().get("payload", [])
+
+                if company_results:
+                    company_id = company_results[0]["id"]
+                else:
+                    
+                    company_create = await client.post(
+                        f"{base_url}/api/v1/accounts/{account_id}/companies",
+                        json={"name": company},
+                        headers=headers,
+                        timeout=10,
+                    )
+                    company_id = company_create.json().get("id")
+
+                if company:
+                    await client.put(
+                        f"{base_url}/api/v1/accounts/{account_id}/contacts/{contact_id}",
+                        json={
+                            "additional_attributes": {
+                                "company_name": company
+                            }
+                        },
+                        headers=headers,
+                        timeout=10,
+                    )
+                    print(f"Chatwoot company_name actualizado: {company}")
+    except Exception as e:
+        print(f"Error actualizando Chatwoot: {e}")
+        
+        
+        
 def get_or_request_email(state: State, next_intent: str):
     thread_id = state.get("thread_id") or ""
 
@@ -708,6 +804,7 @@ Máximo 2 oraciones, sin signos de exclamación.
                     )
                 )
             db.commit()
+            await update_chatwoot_contact(phone_number=thread_id or "", name=name or "")
 
             return {
                 "greeting_step": "register_company_sede",
@@ -772,6 +869,8 @@ Máximo 2 oraciones. Sin signos de exclamación.
                 )
             )
             db.commit()
+            print(f"DEBUG empresa antes de chatwoot: {repr(empresa)}")
+            await update_chatwoot_contact(phone_number=thread_id or "", company=empresa or "")
 
             name = user.name if user and user.name and user.name != "pending" else ""
 
@@ -853,19 +952,32 @@ def diagnosis_flow(state: State):
     step = state.get("diagnosis_step") or 0
     history = state.get("diagnosis_history") or []
     messages_state = state.get("messages", [])
-    last_user_message = str(messages_state[-1].content)
+    last_msg_obj = messages_state[-1]
+
+    if isinstance(last_msg_obj.content, list):
+        image_context = llm_diagnosis.invoke([
+            SystemMessage(content=(
+                "Eres un técnico de soporte. Describe en texto plano el error que ves en la imagen. "
+                "Incluye: aplicación, código de error, mensaje exacto, sistema operativo o VM afectada, "
+                "y cualquier otro detalle visible. Máximo 4 oraciones."
+            )),
+            last_msg_obj
+        ])
+        last_user_message = f"[Imagen del error]: {str(image_context.content).strip()}"
+    else:
+        last_user_message = str(last_msg_obj.content)
 
     updated_history = history + [f"Usuario: {last_user_message}"]
     updated_history_text = "\n".join(updated_history)
 
-    if step >= 1 and history:
+    if step >= 2:
         last_bot_message = ""
         for entry in reversed(history):
             if entry.startswith("bot:"):
                 last_bot_message = entry[4:].strip()
                 break
 
-        is_clarification = llm.invoke([
+        is_clarification = llm_diagnosis.invoke([
             SystemMessage(content="Responde SOLO con 'si' o 'no'. Sin explicaciones"),
             HumanMessage(content=f"""
 El tecnico de soporte le hizo esta pregunta al usuario:
@@ -875,34 +987,57 @@ El usuario respondio:
 "{last_user_message}"
 
 ¿La respuesta del usuario es una pregunta de aclaración sobre términos técnicos o sobre cómo hacer algo que el técnico mencionó?
-(por ejemplo: "¿qué son los logs?", "¿cómo borro la caché?", "¿dónde veo eso?", "¿qué es eso?", "no entiendo")
+(por ejemplo: "¿qué son los logs?", "¿cómo borro la caché?", "¿dónde veo eso?", "¿qué es eso?", "no entiendo", "¿qué es ping?", "¿cómo hago eso?")
 
 Responde SOLO: si / no
 """)
         ])
 
         if "si" in str(is_clarification.content).strip().lower():
-            clarification_response = llm.invoke([
+            clarification_response = llm_diagnosis.invoke([
                 SystemMessage(content="""
 Eres Santiago, técnico de soporte de Serviunix hablando por WhatsApp.
-El usuario preguntó cómo hacer algo técnico.
-Si no sabes que operativo es el sistema pregunta primero.
-Despues dale el paso especifico para buscar ese algo tecnico que pregunto el usuario.
-No expliques de forma muy larga que sea corta y simple.
-Vuelve a decir la pregunta del diagnostico de forma que no se vea repetitiva cuando le preguntaste la primera vez.
+El usuario no entendió algo técnico que le preguntaste.
+
+REGLAS ESTRICTAS:
+
+1. PRIMERO detecta el nivel técnico del usuario por cómo escribió en el historial:
+   - TÉCNICO: usa palabras como servidor, ping, SSH, IP, logs, firewall, DNS, terminal
+   - USUARIO FINAL: escribe casual, dice "no me abre", "no funciona", no usa términos técnicos
+
+2. Si pregunta por logs, terminal, SSH, comandos o configuración de servidor:
+   - Si es TÉCNICO → explícale cómo hacerlo en 1 oración y repite la pregunta
+   - Si es USUARIO FINAL → dile "no te preocupes por eso, yo lo escalo" y pregunta algo observable
+
+3. Si pregunta por algo del navegador (caché, cookies):
+   - Explícalo en 1 oración simple y repite la pregunta
+
+4. Si no entiende un término técnico:
+   - Tradúcelo a palabras cotidianas en 1 oración y repite la pregunta
+
+TRADUCCIONES A LENGUAJE SIMPLE:
+- "hacer ping" → "¿otros compañeros tienen el mismo problema?"
+- "revisar logs" → "¿el error empezó de repente o después de algún cambio?"
+- "cliente SMB" → "¿desde otro computador de la oficina puedes abrir esa carpeta?"
+- "servicio caído" → "¿otras cosas de la empresa también fallan o solo esto?"
+- "resolución DNS" → "¿puedes abrir otras páginas o sistemas de la empresa?"
+
+ESTILO:
+- Máximo 2 oraciones
+- Sin comandos de terminal a usuarios finales
+- Natural, directo, sin formalismos
 """),
                 HumanMessage(content=f"""
-Contexto del problema (historial de diagnostico):
+Historial completo:
 {chr(10).join(history)}
 
-La pregunta de diagnostico que hiciste fue:
+La pregunta de diagnóstico que hiciste fue:
 "{last_bot_message}"
 
-El usuario pregunto:
+El usuario preguntó o no entendió:
 "{last_user_message}"
 
-Usando el contexto del problema, explicale exactamente donde o como hacer lo que pregunta,
-luego repite la pregunta del diagnostico.
+Responde según su nivel técnico y luego repite la pregunta adaptada.
 """)
             ])
             return {
@@ -911,66 +1046,101 @@ luego repite la pregunta del diagnostico.
                 "messages": [AIMessage(content=str(clarification_response.content))]
             }
 
-    if step >= 1:
-        enough = llm.invoke([
-            SystemMessage(content="Responde SOLO con 'si' o 'no'. Sin explicaciones."),
-            HumanMessage(content=f"""
-Eres un ingeniero de soporte. Revisa este historial.
+    if step >= 3:
+        enough = llm_diagnosis.invoke([
+    SystemMessage(content="Responde SOLO con 'si' o 'no'. Sin explicaciones."),
+    HumanMessage(content=f"""
+Eres un ingeniero de soporte senior. Revisa este historial.
 
 HISTORIAL:
 {updated_history_text}
 
-¿Tienes suficiente información para abrir un ticket con: descripción del problema, cuándo ocurre y qué sistema está afectado?
-Si puedes responder al menos 2 de esas 3 cosas con el historial, responde 'si'.
-Si no, responde 'no'.
+¿Tienes suficiente para abrir un ticket útil?
 
-Responde SOLO: si / no
+Considera que ES suficiente si tienes:
+- El error exacto o síntoma concreto (incluye imágenes descritas)
+- El sistema afectado con detalle
+- Cuándo empezó o qué contexto hay (aunque sea "de repente sin cambios")
+- Si afecta a uno o varios usuarios
+
+NO es necesario saber qué intentó el usuario si ya está claro que no ha intentado nada 
+o si el problema es de infraestructura que el usuario no puede resolver solo.
+
+Si tienes 3 de esas 4 cosas, responde 'si'.
 """)
-        ])
+])
 
         tiene_suficiente = "si" in str(enough.content).strip().lower()
 
-        if tiene_suficiente or step >= 5:
-            severity = detected_incident_severity(updated_history_text)
+        if tiene_suficiente or step >= 8:
+            severity, servicio = detected_incident_severity(updated_history_text)
+            resumen_problema = llm_diagnosis.invoke([
+                SystemMessage(
+                    content="Responde SOLO con una frase corta de maximo 6 palabras que describa el problema tecnico. Sin puntos, sin mayusculas al inicio, sin explicaciones"
+                ),
+                HumanMessage(
+                    content=f"El problema diagnosticado fue:\n{updated_history_text}"
+                )
+            ])
+            description_butt = str(resumen_problema.content).strip().rstrip(".")
+
             return {
                 "diagnosis_step": None,
+                "diagnosis_history": updated_history,
                 "support_option_step": "waiting_choice",
                 "intent": "support_options",
                 "severity": severity,
-                "diagnosis_history": updated_history,
+                "servicio": servicio,
                 "messages": [
                     AIMessage(
                         content=(
-                            "Ya tengo una idea de lo que está pasando.\n\n"
-                            "Podemos hacer dos cosas:\n\n"
-                            "1. Crear Ticket\n2. Hablar con un agente (puede tardarse un poco)\n\n"
-                            "¿Que prefieres?"
+                            f"Ok, lo del {description_butt} parece algo que hay que escalar.\n"
+                            "¿Prefieres que cree un ticket o te paso a alguien del equipo?"
                         )
                     )
                 ]
             }
 
-    if step == 0 and history is None:
+    if step == 0 and not history:
         return {
             "diagnosis_step": 1,
             "diagnosis_history": [],
             "messages": [AIMessage(content="Cuéntame qué está pasando y te ayudo a crear el ticket.")]
         }
 
-    response = llm.invoke([
-        SystemMessage(content="""
-Eres Santiago, técnico de soporte de Serviunix hablando por WhatsApp.
+    response = llm_diagnosis.invoke([
+    SystemMessage(content="""
+Eres Santiago, técnico de soporte de Serviunix por WhatsApp.
 
-Haces UNA pregunta técnica corta para entender mejor el problema.
-Sin listas, sin formalismos. Una sola pregunta directa.
+Tu única tarea: escribir UNA pregunta corta al usuario. Nada más.
+
+FORMATO DE SALIDA OBLIGATORIO:
+- Solo la pregunta. Sin introducción, sin análisis, sin separadores.
+- Máximo 1 oración.
+- Sin signos de exclamación.
+
+EJEMPLOS DE LO QUE DEBES DEVOLVER:
+"¿Otras VMs también fallan o solo esa?"
+"¿Esto empezó después de algún cambio o de repente?"
+"¿Solo a ti te pasa o también a compañeros?"
+
+EJEMPLOS DE LO QUE JAMÁS DEBES DEVOLVER:
+"Por el historial, este usuario es técnico..." ← PROHIBIDO
+"---" ← PROHIBIDO  
+"Según lo que describes..." ← PROHIBIDO
+Cualquier texto antes o después de la pregunta ← PROHIBIDO
+
+Si ya tienes el error de una imagen, no preguntes qué error tiene.
+Pregunta por lo que aún no sabes: cuándo empezó, si afecta a otros, qué ya intentaron.
 """),
-        HumanMessage(content=f"""
+    HumanMessage(content=f"""
 HISTORIAL:
 {updated_history_text}
 
-Siguiente pregunta de diagnóstico.
+Devuelve SOLO la siguiente pregunta. Una oración. Sin nada más.
 """)
-    ])
+])
+
 
     question = str(getattr(response, "content", response)).strip()
 
@@ -979,6 +1149,7 @@ Siguiente pregunta de diagnóstico.
         "diagnosis_history": updated_history + [f"bot: {question}"],
         "messages": [AIMessage(content=question)]
     }
+
 
 
 def offer_support_options(state: State):
@@ -1014,10 +1185,8 @@ def offer_support_options(state: State):
                 "messages": [
                     AIMessage(
                         content=(
-                            "Dale, es el mismo.\n\n"
-                            "Podemos hacer dos cosas:\n"
-                            "1. Crear ticket \n2. Hablar con alguien (suele demorarse)\n\n"
-                            "¿Cual prefieres?"
+                            "Dale, es el mismo.\n"
+                            "¿Prefieres que cree un ticket o te paso a alguien del equipo?"
                         )
                     )
                 ]
@@ -1046,10 +1215,8 @@ def offer_support_options(state: State):
             "messages": [
                 AIMessage(
                     content=(
-                        "Ya tengo una idea de lo que está pasando.\n\n"
-                        "Podemos hacer dos cosas:\n"
-                        "1. Ticket\n2. Hablar con un agente (puede tardar un poco)\n"
-                        "¿Que prefieres?"
+                        "Esto ya parece un tema del sistema.\n"
+                        "¿Prefieres que cree un ticket o te paso a alguien del equipo?"
                     )
                 )
             ]
@@ -1096,38 +1263,56 @@ def offer_support_options(state: State):
 
 def detected_incident_severity(history_text):
     response = llm.invoke([
-        SystemMessage(content="Eres un experto en soporte IT."),
+        SystemMessage(
+            content="Eres un experto en soporte IT."
+        ),
         HumanMessage(content=f"""
-Analiza el incidente y responde SOLO con una palabra: baja / media / alta
+        Analiza el incidente y responde SOLO en JSON sin markdown:
+        {{
+            "prioridad": "baja / moderada / alta / critica",
+            "servicio": "una de: Analisis de Datos / Backups / Computador - Impresiora / Consultoria / Correo Electronico / Datacenter Serviunix / ERP / Maquinas Virtuales / Nextcloud - Samba - Alfreso / Otras Aplicaciones / Proxy - Firewall / Redes"
+        }}
 
-alta: sistemas caídos, servidores, VPN, red corporativa, operaciones críticas
-media: errores en aplicaciones, correo, conexión, afecta varios usuarios
-baja: consultas, configuración, problemas menores, acceso o contraseña
+        Criterios de prioridad:
+        - critica: servidores caidos, red corporativa caida, ERP sin funcionar, datacenter, afecta toda la empresa
+        - alta: VPN, correo sin funcionar, aplicaciones criticas, afecta varios usuarios
+        - moderada: errores en aplicaciones, problemas de acceso, afecta un area
+        - baja: consultas, configuracion, problemas menores, un solo usuario
 
-INCIDENTE:
-{history_text}
-
-Responde SOLO: baja / media / alta
-""")
+        INCIDENTE:
+        {history_text}
+        """)
     ])
 
-    return str(response.content).strip().lower()
+    try:
+        text = re.sub(r"```json|```", "", str(response.content)).strip()
+        data = json.loads(text)
+        prioridad = data.get("prioridad", "moderada").lower()
+        servicio = data.get("servicio", "Otras Aplicaciones")
+    except:
+        prioridad = "moderada"
+        servicio = "Otras Aplicaciones"
+
+    return prioridad, servicio
 
 
 async def support_agent(state):
-    print("=== ENTRANDO A SUPPORT_AGENT ===")
+    print("ENTRANDO A SUPPORT AGENT")
     print(f"history: {state.get('diagnosis_history')}")
     print(f"severity: {state.get('severity')}")
+    print(f"servicio: {state.get('servicio')}")
 
     if llm_with_tools is None:
         raise Exception("LLM no inicializado")
 
     history = state.get("diagnosis_history") or []
-    severity = state.get("severity", "media")
+    severity = state.get("severity", "moderada")
     thread_id = state.get("thread_id") or ""
+    servicio_nombre = state.get("servicio", "Otras Aplicaciones")
+    servicio_value = get_servicio_value(servicio_nombre)
 
     if len(history) < 2:
-        print(f"[support_agent] diagnosis_history vacío para {thread_id} — usando mensajes crudos")
+        print(f"[support_agent] diagnosis_history vacio para {thread_id} - usando mensajes crudos")
         messages_state = state.get("messages", [])
         history = [
             f"{'usuario' if m.type == 'human' else 'bot'}: {m.content}"
@@ -1143,7 +1328,7 @@ async def support_agent(state):
     if create_tool is None:
         return {
             "intent": "human",
-            "messages": [AIMessage(content="No pude crear el ticket, te conecto con alguien.")]
+            "messages": [AIMessage(content="No pude crear, te conecto con alguien.")]
         }
 
     db = SessionLocal()
@@ -1151,30 +1336,40 @@ async def support_agent(state):
         stmt_user = select(users).where(users.c.phone_number == thread_id)
         user = db.execute(stmt_user).fetchone()
 
+        # Validar email correctamente
+        customer = None
+        if user and user.email:
+            email_clean = user.email.strip().lower()
+            if (
+                email_clean and
+                email_clean not in ("pending", "null", "none", "na", "n/a", "sin correo", "") and
+                re.match(r"^[^@]+@[^@]+\.[^@]+$", email_clean)
+            ):
+                customer = email_clean
+
+        if not customer:
+            print(f"[support_agent] WARN: usuario {thread_id} sin email válido, ticket se creará con thread_id como customer")
+
+        user_name = (user.name if user else None) or ""
+
         if user:
-            user_info = f"""
-Informacion del usuario
-
-Nombre: {user.name or 'No registrado'}
-Empresa: {user.company if user.company and user.company != 'pending' else 'No registrada'}
-Correo: {user.email or 'No disponible'}
-Teléfono: {thread_id}
-Sede: {user.sede or 'No registrada'}
-
-Diagnostico del problema
-
-{description}
-"""
+            user_info = (
+                "Informacion del usuario\n\n"
+                f"Nombre: {user.name or 'No registrado'}\n"
+                f"Empresa: {user.company if user.company and user.company != 'pending' else 'No registrada'}\n"
+                f"Telefono: {thread_id}\n"
+                f"Correo: {customer or 'No registrado'}\n"
+                f"Sede: {user.sede or 'No registrada'}\n\n"
+                "Diagnostico del problema\n\n"
+                f"{description}"
+            )
         else:
             user_info = description
-
-        customer = user.email if user and user.email and user.email not in ("pending", "", None) else None
-        user_name = (user.name if user else None) or ""
 
     finally:
         db.close()
 
-    if create_user_tool:
+    if create_user_tool and customer:
         try:
             name_parts = user_name.strip().split(" ", 1)
             firstname = name_parts[0] if name_parts else "Usuario"
@@ -1194,53 +1389,82 @@ Diagnostico del problema
         "params": {
             "title": title,
             "group": "Users",
-            "customer": customer or thread_id,
+            "customer": customer if customer else thread_id,
             "article_body": user_info,
+            "priority": PRIORIDAD_MAP.get(severity, "2 normal"),
         }
     })
 
-    print("Resultado create_ticket:", result)
+    print("Resultado create_ticket", result)
 
     ticket_number = "N/A"
+    ticket_id = None
 
     if isinstance(result, list) and len(result) > 0:
         text = result[0].get("text", "")
         try:
             data = json.loads(text)
             ticket_number = data.get("number", "N/A")
+            ticket_id = data.get("id")
         except:
-            match = re.search(r'"number":\s*"(\d+)"', text)
-            if match:
-                ticket_number = match.group(1)
+            match_num = re.search(r'"number":\s*"(\d+)"', text)
+            match_id = re.search(r'"id":\s*(\d+)', text)
+            if match_num:
+                ticket_number = match_num.group(1)
+            if match_id:
+                ticket_id = int(match_id.group(1))
     elif isinstance(result, str):
-        match = re.search(r'"number":\s*"(\d+)"', result)
-        if match:
-            ticket_number = match.group(1)
+        match_num = re.search(r'"number":\s*"(\d+)"', result)
+        match_id = re.search(r'"id":\s*(\d+)', result)
+        if match_num:
+            ticket_number = match_num.group(1)
+        if match_id:
+            ticket_id = int(match_id.group(1))
     elif isinstance(result, dict):
         ticket_number = result.get("number", "N/A")
+        ticket_id = result.get("id")
+
+    if ticket_id and servicio_value:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.put(
+                    f"{os.environ['ZAMMAD_URL']}/api/v1/tickets/{ticket_id}",
+                    json={"servicio": servicio_value},
+                    headers={
+                        "Authorization": f"Token token={os.environ['ZAMMAD_HTTP_TOKEN']}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=30,
+                )
+                print(f"PUT status: {r.status_code}")
+                print(f"PUT response: {r.text}")
+                r.raise_for_status()
+                print(f"Campo servicio actualizado via API {servicio_value} en ticket {ticket_id}")
+        except Exception as e:
+            print(f"Error actualizando campo servicio API: {e}")
 
     diagnosis_history = state.get("diagnosis_history") or []
     if thread_id:
         save_conversation_memory(thread_id, diagnosis_history)
 
-    print(f"=== TICKET CREADO: #{ticket_number} ===")
+    print(f"TICKET CREADO #{ticket_number}")
 
     return {
         "messages": [
-            AIMessage(content=(
-                f"Listo, ticket creado.\n\n"
-                f"Titulo: {title}\n"
-                f"ID: #{ticket_number}\n\n"
-                f"Con ese número puedes hacer seguimiento a tu caso."
-            ))
+            AIMessage(
+                content=(
+                    f"Ya te cree el ticket.\n"
+                    f"Es el #{ticket_number}, sobre {title}."
+                )
+            )
         ],
         "support_option_step": None,
         "diagnosis_step": None,
         "diagnosis_history": None,
-        "severity": None
+        "severity": None,
+        "servicio": None,
     }
-
-
+    
 def generate_ticket_summary(history, severity):
     history = history or []
     history_text = "\n".join(history)
@@ -1252,21 +1476,29 @@ def generate_ticket_summary(history, severity):
             "Sin saludos, sin preguntas, sin texto adicional."
         )),
         HumanMessage(content=f"""
-Convierte este diagnóstico en un ticket profesional.
+Convierte este diagnóstico en un ticket de soporte.
+
+REGLAS:
+- La descripción debe ser un párrafo continuo, natural, como un resumen técnico.
+- Incluye TODOS los datos concretos que aparezcan en el historial: horas, fechas, errores exactos, sistemas afectados, pasos ya intentados, cuántos usuarios afectados.
+- Si el usuario mencionó una hora o fecha, escríbela textualmente en la descripción.
+- No uses listas ni bullets. Solo párrafo.
+- La descripción debe tener mínimo 3 oraciones.
 
 DIAGNOSTICO:
 {history_text}
 
 SEVERIDAD: {severity}
 
-Devuelve EXACTAMENTE en este formato y nada más:
+Devuelve EXACTAMENTE en este formato:
 
-TITULO: [titulo corto del problema]
-DESCRIPCION: [descripcion detallada del problema]
+TITULO: [titulo corto máximo 10 palabras]
+DESCRIPCION: [párrafo detallado con todos los datos del historial]
 """)
     ])
-
-    text = str(response.content or "")
+   
+    
+    text = clean_html_entities(str(response.content or ""))
     title = "Incidente reportado por usuario"
     description = text
 
@@ -1360,16 +1592,15 @@ async def check_ticket_status(state: State):
         )]
     }
 
-
 async def router(state: State):
     print(f"=== ROUTER intent={state.get('intent')} support_option_step={state.get('support_option_step')} diagnosis_step={state.get('diagnosis_step')} email_request_step={state.get('email_request_step')} ===")
 
     thread_id = state.get("thread_id") or ""
     messages_list = state.get("messages", [])
 
+    # 1. Si el agente humano ya tomó el caso
     if state.get("human_escalated"):
         last = str(messages_list[-1].content).lower() if messages_list else ""
-
         quiere_salir = detect_intent_simple(
             last,
             {
@@ -1377,32 +1608,23 @@ async def router(state: State):
                 "espera": "sigue esperando al agente o cualquier otra cosa"
             }
         )
-
         if "salir" in quiere_salir:
-            return {
-                "intent": "chat_general",
-                "human_escalated": False
-            }
-
+            return {"intent": "chat_general", "human_escalated": False}
         return {"intent": "waiting_agent"}
 
+    # 2. Flujo de solicitud de email pendiente
     if state.get("email_request_step") == "ask_email":
         last_email = str(messages_list[-1].content).strip() if messages_list else ""
-
         if re.match(r"^[^@]+@[^@]+\.[^@]+$", last_email):
             db2 = SessionLocal()
             try:
-                user_row = db2.execute(select(users).where(users.c.phone_number == thread_id)).fetchone()
-                user_company = user_row.company if user_row and user_row.company != "pending" else None
-                user_name = user_row.name if user_row and user_row.name != "pending" else None
-
                 db2.execute(
                     update(users)
                     .where(users.c.phone_number == thread_id)
                     .values(email=last_email)
                 )
                 db2.commit()
-
+                await update_chatwoot_contact(phone_number=thread_id, email=last_email)
             finally:
                 db2.close()
 
@@ -1416,21 +1638,25 @@ async def router(state: State):
                 "severity": state.get("severity"),
                 "intent": pending if pending in ("human", "crear_ticket") else "diagnosis_flow",
             }
-
         return {
             "email_request_step": "ask_email",
             "messages": [AIMessage(content="Ese correo no parece válido, ¿me lo confirmas?")]
         }
 
+    
     _flujo_activo = (
         bool(state.get("password_step")) or
         (state.get("diagnosis_step") is not None) or
-        (state.get("ticket_status_step") == "ask_id")
+        (state.get("ticket_status_step") == "ask_id") or
+        bool(state.get("support_option_step"))
     )
 
     if _flujo_activo:
-        _last = str(messages_list[-1].content).lower() if messages_list else ""
+        # Si estamos esperando respuesta de opciones, ir directo sin escape hatch
+        if state.get("support_option_step"):
+            return {"intent": "support_options"}
 
+        _last = str(messages_list[-1].content).lower() if messages_list else ""
         _quiere_salir = detect_intent_simple(
             _last,
             {
@@ -1465,15 +1691,6 @@ async def router(state: State):
                 "password_step": None
             }
 
-        if "password" in _quiere_salir:
-            return {
-                "intent": "password_flow",
-                "password_step": "confirmation_continue",
-                "diagnosis_step": None,
-                "diagnosis_history": None,
-                "support_option_step": None,
-            }
-
         if "cancelar" in _quiere_salir:
             return {
                 "intent": "chat_general",
@@ -1484,61 +1701,70 @@ async def router(state: State):
                 "ticket_status_step": None,
             }
 
-    if state.get("password_step"):
-        return {"intent": "password_flow"}
+        if state.get("diagnosis_step") is not None:
+            return {"intent": "diagnosis_flow"}
 
+        if state.get("ticket_status_step") == "ask_id":
+            return {"intent": "estado_ticket"}
+
+        if state.get("password_step"):
+            return {"intent": "chat_general"}
+
+    # 4. Greeting activo (excepto waiting_problem)
     if state.get("greeting_step") and state.get("greeting_step") != "waiting_problem":
         return {"intent": "greeting_flow"}
 
+    # 5. Diagnosis activo — ANTES del bloque waiting_problem
     if state.get("diagnosis_step") is not None:
         return {"intent": "diagnosis_flow"}
 
-    if state.get("support_option_step") in ("waiting_choice", "similar_detected", "waiting_similar"):
+    # 6. Support options activo
+    if state.get("support_option_step") == "waiting_choice":
         last_message = messages_list[-1] if messages_list else None
         user_text = str(last_message.content).lower() if last_message else ""
 
-        if state.get("support_option_step") == "waiting_choice":
-            detected = detect_intent_simple(
-                user_text,
-                {
-                    "ticket": "dice 1, o quiere crear un ticket",
-                    "agente": "dice 2, o quiere hablar con un agente humano",
-                    "otro": "otra cosa"
-                },
-                context="El bot pregunto: ¿Que prefieres: 1. Ticket o 2. Hablar con alguien?"
-            )
-            if "ticket" in detected:
-                email_state = get_or_request_email(state, "crear_ticket")
-                if email_state:
-                    return email_state
-                return {
-                    "intent": "crear_ticket",
-                    "support_option_step": None,
-                    "diagnosis_step": None,
-                    "diagnosis_history": state.get("diagnosis_history"),
-                    "severity": state.get("severity"),
-                }
-
-            if "agente" in detected:
-                email_state = get_or_request_email(state, "human")
-                if email_state:
-                    return email_state
-                return {"intent": "human", "support_option_step": None, "diagnosis_step": None}
+        detected = detect_intent_simple(
+            user_text,
+            {
+                "ticket": "dice 1, o quiere crear un ticket",
+                "agente": "dice 2, o quiere hablar con un agente humano",
+                "otro": "otra cosa"
+            },
+            context="El bot pregunto: ¿Que prefieres: 1. Ticket o 2. Hablar con alguien?"
+        )
+        if "ticket" in detected:
+            email_state = get_or_request_email(state, "crear_ticket")
+            if email_state:
+                return email_state
+            return {
+                "intent": "crear_ticket",
+                "support_option_step": None,
+                "diagnosis_step": None,
+                "diagnosis_history": state.get("diagnosis_history"),
+                "severity": state.get("severity"),
+                "servicio": state.get("servicio")
+            }
+        if "agente" in detected:
+            email_state = get_or_request_email(state, "human")
+            if email_state:
+                return email_state
+            return {"intent": "human", "support_option_step": None, "diagnosis_step": None}
 
         return {"intent": "support_options"}
 
     if state.get("support_option_step"):
         return {"intent": "support_options"}
 
+    # 7. Ticket step activo
     if state.get("ticket_step"):
         return {"intent": "crear_ticket"}
 
+    # 8. Ticket status activo
     if state.get("ticket_status_step") == "ask_id":
         return {"intent": "estado_ticket"}
 
-    greeting_step = state.get("greeting_step")
-
-    if greeting_step == "waiting_problem" and state.get("diagnosis_step") is None:
+    # 9. greeting_step == waiting_problem → detectar intent del mensaje nuevo
+    if state.get("greeting_step") == "waiting_problem":
         db = SessionLocal()
         try:
             stmt = select(users).where(users.c.phone_number == thread_id)
@@ -1553,16 +1779,16 @@ async def router(state: State):
         finally:
             db.close()
 
-        last = messages_list[-1].content if messages_list else ""
+        last = str(messages_list[-1].content) if messages_list else ""
 
         detected_general = detect_intent_simple(
-            str(last),
+            last,
             {
                 "estado_ticket": "quiere saber el estado de un ticket, menciona explicitamente la palabra ticket y estado o seguimiento",
                 "password": "tiene problema con contraseña, clave o acceso al correo",
                 "humano": "quiere hablar con un agente humano",
                 "crear_ticket": "quiere crear un ticket o reportar un problema",
-                "problema": "describe un problema tecnico activo: errores, caidas, fallas, equipos que no encienden, servidores, redes",
+                "problema": "describe un problema tecnico activo: errores, caidas, fallas, equipos que no encienden, servidores, redes, migracion, configuracion",
                 "resuelto": "dice que su problema ya se resolvio, que ya funciona, que ya esta bien",
                 "charla": "saludo, pregunta personal, conversacion casual"
             }
@@ -1571,24 +1797,11 @@ async def router(state: State):
         if "estado_ticket" in detected_general:
             return {"intent": "estado_ticket", "ticket_status_step": "ask_id"}
 
-        if "password" in detected_general:
-            return {"intent": "password_flow", "password_step": "confirmation_continue"}
-
         if "resuelto" in detected_general:
             return {"intent": "chat_general"}
 
         if "charla" in detected_general:
             return {"intent": "chat_general"}
-
-        if "crear_ticket" in detected_general:
-            email_state = get_or_request_email(state, "crear_ticket")
-            if email_state:
-                return email_state
-            return {
-                "intent": "diagnosis_flow",
-                "diagnosis_step": 0,
-                "diagnosis_history": []
-            }
 
         if "humano" in detected_general:
             email_state = get_or_request_email(state, "human")
@@ -1596,24 +1809,16 @@ async def router(state: State):
                 return email_state
             return {"intent": "human"}
 
-        match = check_similar_problem(thread_id, str(last)) if thread_id else None
-        if match:
-            return {
-                "intent": "support_options",
-                "greeting_step": "waiting_problem",
-                "similar_problem": match.get("summary"),
-                "support_option_step": "similar_detected"
-            }
-
+        # Para cualquier problema o solicitud de ticket, iniciar diagnosis con el mensaje ya incluido
         return {
             "intent": "diagnosis_flow",
-            "diagnosis_step": 0,
-            "diagnosis_history": [f"problema inicial del usuario: {last}"]
+            "diagnosis_step": 1,
+            "diagnosis_history": [f"Usuario: {last}"],
         }
 
+    # 10. Primer mensaje — usuario conocido o nuevo
     if not state.get("greeting_step") and len(messages_list) == 1:
         db = SessionLocal()
-
         try:
             stmt = select(users).where(users.c.phone_number == thread_id)
             user_row = db.execute(stmt).fetchone()
@@ -1624,23 +1829,12 @@ async def router(state: State):
                 saved_step = user_row.greeting_step or None
 
                 if saved_step and saved_step not in ("waiting_problem", None):
-                    return {
-                        "intent": "greeting_flow",
-                        "greeting_step": saved_step
-                    }
+                    return {"intent": "greeting_flow", "greeting_step": saved_step}
 
-                sede = user_row.sede
+                if user_row.sede:
+                    return {"intent": "greeting_flow", "greeting_step": "confirm_branch"}
 
-                if sede:
-                    return {
-                        "intent": "greeting_flow",
-                        "greeting_step": "confirm_branch"
-                    }
-
-                return {
-                    "intent": "greeting_flow",
-                    "greeting_step": "register_company_sede"
-                }
+                return {"intent": "greeting_flow", "greeting_step": "register_company_sede"}
 
             return {
                 "intent": "greeting_flow",
@@ -1650,6 +1844,7 @@ async def router(state: State):
         finally:
             db.close()
 
+    # 11. Fallback general
     last_message = messages_list[-1] if messages_list else None
     user_text = str(last_message.content).lower() if last_message else ""
 
@@ -1673,11 +1868,6 @@ async def router(state: State):
             "diagnosis_step": 0,
             "diagnosis_history": []
         }
-
-    if "password" in detected:
-        if not state.get("password_step"):
-            return {"intent": "password_flow", "password_step": "confirmation_continue"}
-        return {"intent": "password_flow"}
 
     if "humano" in detected:
         return {"intent": "human"}
@@ -1706,274 +1896,6 @@ Haz preguntas de diagnóstico cuando haya un problema técnico.
 
     response = llm.invoke(messages_state)
     return {"messages": [response]}
-
-
-def handle_password_issue(state: State):
-
-    messages_state = state.get("messages", [])
-    last_message = str(messages_state[-1].content).strip().lower()
-    step = state.get("password_step")
-
-    if re.search(r"\b(mi\s)?(clave|contraseña|password)\s+es\b", last_message):
-        return {
-            "messages": [
-                AIMessage(content="Ojo, nunca compartas tu contraseña por acá. Soporte jamás te la va a pedir.")
-            ]
-        }
-
-    if not step:
-        return {
-            "password_step": "confirm_owner",
-            "security_risk": 0,
-            "messages": [guided_response(
-                objetivo="Preguntarle si esta solicitud es para su propia cuenta corporativa (si/no).",
-                contexto="Flujo de recuperación de contraseña."
-            )]
-        }
-
-    if step == "confirm_owner":
-        detected = detect_intent_simple(
-            last_message,
-            {"confirma": "dice que sí, que es su cuenta", "niega": "dice que no", "otro": "otra cosa"}
-        )
-        if "niega" in detected:
-            return {
-                **reset_password_flow(),
-                "intent": "chat_general",
-                "messages": [guided_response(
-                    objetivo="Decirle que solo puede ayudarle con su propia cuenta.",
-                    contexto="El usuario indicó que no es su cuenta."
-                )]
-            }
-        if "confirma" in detected:
-            return {
-                "password_step": "ask_email",
-                "messages": [guided_response(
-                    objetivo="Pedirle su correo corporativo.",
-                    contexto="Confirmó que es su cuenta."
-                )]
-            }
-        return {
-            "password_step": "confirm_owner",
-            "messages": [guided_response(
-                objetivo="Preguntarle si esta solicitud es para su propia cuenta (si/no).",
-                contexto="No quedó claro si es su cuenta.",
-                historial=[last_message]
-            )]
-        }
-
-    if step == "ask_email":
-        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", last_message):
-            return {
-                "password_step": "ask_email",
-                "messages": [guided_response(
-                    objetivo="Pedirle su correo corporativo.",
-                    contexto="El usuario no dio un correo válido.",
-                    historial=[last_message]
-                )]
-            }
-
-        try:
-            zimbra = ZimbraService(
-                url="https://correo.serviunix.com/service/soap",
-                email=last_message,
-                password=os.environ.get("ZIMBRA_PASSWORD")
-            )
-            zimbra.authenticate()
-            real_data = {
-                "folders": zimbra.get_user_folders(),
-                "last_sent_subjects": zimbra.get_last_sent_subjects(),
-                "signature": zimbra.get_user_signature(),
-                "contacts": zimbra.get_contacts(),
-                "filters": zimbra.get_filters(),
-            }
-        except Exception as e:
-            print("Error conectando con Zimbra:", e)
-            return {"intent": "human"}
-
-        return {
-            "password_step": "ask_recent_change",
-            "email": last_message,
-            "real_data": real_data,
-            "messages": [guided_response(
-                objetivo="Preguntarle si ha cambiado su contraseña en los últimos 3 meses (si/no).",
-                contexto="Verificación de identidad en curso."
-            )]
-        }
-
-    if step == "confirmation_continue":
-        detected = detect_intent_simple(
-            last_message,
-            {"confirma": "dice que sí quiere recuperarla", "niega": "dice que no", "otro": "otra cosa"}
-        )
-        if "confirma" in detected:
-            return {
-                "password_step": "confirm_owner",
-                "messages": [guided_response(
-                    objetivo="Confirmar que van a proceder y preguntarle si la solicitud es para su propia cuenta (si/no).",
-                    contexto="El usuario quiere recuperar su contraseña."
-                )]
-            }
-        if "niega" in detected:
-            return {
-                **reset_password_flow(),
-                "intent": "crear_ticket",
-                "ticket_step": "ask_description",
-                "messages": [guided_response(
-                    objetivo="Decirle que le va a crear un ticket para que soporte lo revise.",
-                    contexto="El usuario no quiere recuperar la contraseña ahora."
-                )]
-            }
-        return {
-            "password_step": "confirmation_continue",
-            "messages": [guided_response(
-                objetivo="Preguntarle si quiere recuperar su contraseña ahora (si/no).",
-                contexto="Problema relacionado con acceso o contraseña.",
-                historial=[last_message]
-            )]
-        }
-
-    if step == "ask_recent_change":
-        detected = detect_intent_simple(
-            last_message,
-            {"si": "dice que sí cambió la contraseña recientemente", "no": "dice que no la ha cambiado", "otro": "otra cosa"}
-        )
-        if "no" in detected:
-            return {
-                "password_step": "waiting_confirmation",
-                "messages": [guided_response(
-                    objetivo=(
-                        "Indicarle los pasos para restablecer su contraseña: "
-                        "1. Ir a https://correo.serviunix.com "
-                        "2. Clic en ¿Olvidaste tu contraseña? "
-                        "3. Seguir instrucciones. "
-                        "Preguntarle si pudo hacerlo."
-                    ),
-                    contexto="No ha cambiado la contraseña recientemente."
-                )]
-            }
-        if "si" in detected:
-            return {
-                "password_step": "dynamic_question",
-                "security_questions": select_initial_quetions(),
-                "user_answers": {},
-                "current_question_index": 0,
-                "messages": [guided_response(
-                    objetivo="Decirle que le va a hacer unas preguntas rápidas para verificar su identidad.",
-                    contexto="Cambió la contraseña recientemente, se requiere validación."
-                )]
-            }
-        return {
-            "password_step": "ask_recent_change",
-            "messages": [guided_response(
-                objetivo="Preguntarle si ha cambiado su contraseña en los últimos 3 meses (si/no).",
-                contexto="No quedó claro si cambió la contraseña.",
-                historial=[last_message]
-            )]
-        }
-
-    if step == "waiting_confirmation":
-        detected = detect_intent_simple(
-            last_message,
-            {"resuelto": "dice que sí se resolvió", "no_resuelto": "dice que no funcionó", "otro": "otra cosa"}
-        )
-        if "resuelto" in detected:
-            return {
-                **reset_password_flow(),
-                "messages": [guided_response(
-                    objetivo="Decirle que bueno que se resolvió y preguntarle si necesita algo más.",
-                    contexto="El usuario pudo restablecer la contraseña."
-                )]
-            }
-        if "no_resuelto" in detected:
-            real_data = state.get("real_data") or {}
-            profile = build_account_profile(real_data)
-            select_questions = generate_adaptive_questions(profile, QUESTION_BANK)
-
-            if len(select_questions) < 2:
-                select_questions = select_initial_quetions()
-
-            first_question = select_questions[0]
-
-            return {
-                "password_step": "dynamic_question",
-                "security_questions": select_questions,
-                "user_answers": {},
-                "current_question_index": 0,
-                "intent": "password_flow",
-                "messages": [
-                    AIMessage(
-                        content=f"Ok, vamos a verificar tu identidad con unas preguntas rápidas.\n\n{get_question_text(first_question)}"
-                    )
-                ]
-            }
-
-        return {
-            "password_step": "waiting_confirmation",
-            "messages": [guided_response(
-                objetivo="Preguntarle si pudo restablecer su contraseña con esos pasos (si/no).",
-                contexto="Se le dieron los pasos para restablecer.",
-                historial=[last_message]
-            )]
-        }
-
-    if step == "dynamic_question":
-        questions = state.get("security_questions") or []
-        answers = state.get("user_answers") or {}
-        index = state.get("current_question_index") or 0
-
-        if not questions or index >= len(questions):
-            return {"intent": "human"}
-
-        current_question_key = questions[index]
-        answers[current_question_key] = last_message
-        next_index = index + 1
-
-        if next_index < len(questions):
-            next_question_key = questions[next_index]
-            return {
-                "password_step": "dynamic_question",
-                "security_questions": questions,
-                "user_answers": answers,
-                "current_question_index": next_index,
-                "intent": "password_flow",
-                "messages": [AIMessage(content=get_question_text(next_question_key))]
-            }
-
-        real_data = state.get("real_data", {})
-        score, risk_analysis = calculate_security_score(answers, real_data, QUESTION_BANK)
-
-        validation_summary = {
-            "tipo": "password_reset",
-            "riesgo": score,
-            "analisis_detallado": risk_analysis,
-            "respuestas_usuario": answers,
-        }
-
-        if score >= 70:
-            return {
-                "security_risk": score,
-                "validation_summary": validation_summary,
-                "messages": [guided_response(
-                    objetivo="Decirle que la validación salió bien y que su solicitud va a ser procesada.",
-                    contexto="Score de seguridad suficiente."
-                )]
-            }
-
-        if 40 <= score < 70:
-            additional = select_additional_question(questions, state.get("real_data"), QUESTION_BANK)
-            if not additional:
-                return {"intent": "human", "security_risk": score, "validation_summary": validation_summary}
-            return {
-                "password_step": "dynamic_question",
-                "security_questions": questions + [additional],
-                "user_answers": answers,
-                "current_question_index": len(questions),
-                "security_risk": score,
-                "messages": [AIMessage(content=get_question_text(additional))]
-            }
-
-        return {"intent": "human", "security_risk": score, "validation_summary": validation_summary}
 
 
 def escalate_human(state: State):
@@ -2100,3 +2022,53 @@ def reset_password_flow():
         "security_risk": None,
         "real_data": None
     }
+    
+
+async def load_servicio_values():
+    global SERVICIO_VALUES
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{os.environ['ZAMMAD_URL']}/api/v1/object_manager_attributes",
+                headers={
+                    "Authorization": f"Token token={os.environ['ZAMMAD_HTTP_TOKEN']}",
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            attrs = r.json()
+            for attr in attrs:
+                if attr.get("name") == "servicio" and attr.get("object") == "Ticket":
+                    options = attr["data_option"]["options"]
+                    SERVICIO_VALUES = {item["name"]: item["value"] for item in options}
+                    # print(f"Servicios cargados desde Zammad: {SERVICIO_VALUES}")
+                    return
+        print("Campo 'servicio' no encontrado en Zammad, usando dict vacio")
+    except Exception as e:
+        print(f"Error cargando servicios desde Zammad: {e}")
+        
+def clean_html_entities(text: str) -> str:
+    return (text
+        .replace("&quot;", '"')
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&#39;", "'")
+    )
+    
+    
+def get_servicio_value(nombre: str) -> str:
+    
+    if nombre in SERVICIO_VALUES:
+        return SERVICIO_VALUES[nombre]
+    
+    
+    nombre_lower = nombre.lower().strip()
+    for key, value in SERVICIO_VALUES.items():
+        if key.lower().strip() == nombre_lower:
+            return value
+    
+    return "otras_aplicaciones"
+
+

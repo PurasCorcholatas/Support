@@ -46,7 +46,7 @@ def mark_as_notified(ticket_number: str):
 
 
 async def get_recently_closed_tickets() -> list:
-    url = f"{ZAMMAD_URL}/api/v1/tickets"
+    url = f"{ZAMMAD_URL}/api/v1/tickets/search"
     print(f"[POLLING] Consultando: {url}")
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -54,8 +54,9 @@ async def get_recently_closed_tickets() -> list:
             url,
             headers={"Authorization": f"Token token={ZAMMAD_TOKEN}"},
             params={
-                "state_id": 4,
+                "query": "state_id:4",
                 "limit": 50,
+                "order_by": "desc",
                 "expand": "true"
             }
         )
@@ -64,29 +65,21 @@ async def get_recently_closed_tickets() -> list:
         print(f"[POLLING] Error consultando Zammad: {resp.status_code} {resp.text[:200]}")
         return []
 
-    tickets = resp.json()
-    if not isinstance(tickets, list):
-        print(f"[POLLING] Respuesta inesperada: {type(tickets)}")
+    data = resp.json()
+    
+    
+    if isinstance(data, list):
+        tickets = data
+    elif isinstance(data, dict):
+        ticket_ids = data.get("tickets", [])
+        assets = data.get("assets", {}).get("Ticket", {})
+        tickets = [assets[str(tid)] for tid in ticket_ids if str(tid) in assets]
+    else:
+        print(f"[POLLING] Respuesta inesperada: {type(data)}")
         return []
 
-    since = datetime.now(timezone.utc) - timedelta(minutes=2)
-    recently_closed = []
-
-    for ticket in tickets:
-        close_at_raw = ticket.get("close_at") or ticket.get("updated_at")
-        if not close_at_raw:
-            continue
-        try:
-            close_at = datetime.fromisoformat(close_at_raw.replace("Z", "+00:00"))
-            if close_at >= since:
-                recently_closed.append(ticket)
-                print(f"[POLLING] ✅ Ticket reciente encontrado: #{ticket.get('number')} cerrado a las {close_at}")
-        except Exception as e:
-            print(f"[POLLING] Error parseando fecha #{ticket.get('number')}: {e}")
-            continue
-
-    print(f"[POLLING] {len(recently_closed)} tickets cerrados en los últimos 2 minutos")
-    return recently_closed
+    print(f"[POLLING] {len(tickets)} tickets cerrados encontrados")
+    return tickets
 
 
 async def get_customer_email(client: httpx.AsyncClient, customer_id: int) -> str:
@@ -118,6 +111,7 @@ async def get_ticket_close_note(client: httpx.AsyncClient, ticket_id: int) -> st
     return body
 
 
+
 async def notify_closed_ticket(ticket: dict):
     ticket_number = str(ticket.get("number", ""))
 
@@ -127,8 +121,6 @@ async def notify_closed_ticket(ticket: dict):
     if already_notified(ticket_number):
         print(f"[POLLING] Ticket #{ticket_number} ya notificado, ignorando")
         return
-
-    mark_as_notified(ticket_number)
 
     ticket_title = ticket.get("title", "Sin título")
     owner_id = ticket.get("owner_id")
@@ -159,6 +151,7 @@ async def notify_closed_ticket(ticket: dict):
 
         if not customer_email:
             print(f"[POLLING] Ticket #{ticket_number} sin email de cliente, ignorado")
+            mark_as_notified(ticket_number)
             return
 
         db = SessionLocal()
@@ -172,6 +165,7 @@ async def notify_closed_ticket(ticket: dict):
 
         if not phone_number:
             print(f"[POLLING] No se encontró usuario con email {customer_email}")
+            mark_as_notified(ticket_number)
             return
 
         headers = {
@@ -212,15 +206,7 @@ async def notify_closed_ticket(ticket: dict):
 
         conversation_id = conversations[0].get("id")
 
-        mensaje = (
-            f"Tu incidencia ha sido resuelta ✅\n\n"
-            f"Ticket: #{ticket_number}\n"
-            f"Asunto: {ticket_title}\n"
-            f"Atendido por: {agent_name}"
-        )
-
-        if close_note:
-            mensaje += f"\n\nNota del técnico: {close_note}"
+        mensaje = await generate_message_closed(ticket_number, ticket_title, agent_name, close_note)
 
         msg_resp = await client.post(
             f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages",
@@ -229,11 +215,20 @@ async def notify_closed_ticket(ticket: dict):
         )
 
         if msg_resp.status_code in (200, 201):
-            print(f"[POLLING] ✅ Notificado — Ticket #{ticket_number} → {phone_number}")
+            mark_as_notified(ticket_number)  
+            print(f"[POLLING] Notificado - Ticket #{ticket_number} -> {phone_number}")
+
+            resolve_resp = await client.patch(
+                f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}",
+                headers=headers,
+                json={"status": "resolved"}
+            )
+            print(f"[POLLING] Conversación resuelta: {resolve_resp.status_code}")
         else:
             print(f"[POLLING] Error enviando mensaje: {msg_resp.status_code} {msg_resp.text[:200]}")
-
-
+            
+            
+        
 async def start_zammad_polling(interval: int = 60):
     print(f"[POLLING] Iniciando polling cada {interval}s")
     await asyncio.sleep(10)
@@ -241,8 +236,60 @@ async def start_zammad_polling(interval: int = 60):
         try:
             tickets = await get_recently_closed_tickets()
             print(f"[POLLING] Revisando... {len(tickets)} tickets cerrados encontrados")
+            nuevos = 0
             for ticket in tickets:
-                await notify_closed_ticket(ticket)
+                numero = str(ticket.get("number", ""))
+                if not already_notified(numero):
+                    await notify_closed_ticket(ticket)
+                    nuevos += 1
+            if nuevos == 0:
+                print(f"[POLLING] Sin tickets nuevos por procesar")
         except Exception as e:
             print(f"[POLLING] Error en ciclo: {e}")
         await asyncio.sleep(interval)
+    
+    
+    
+async def generate_message_closed(ticket_number: str, ticket_title: str, agent_name: str, close_note: str):
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 300,
+                "messages": [{
+                    "role": "system",
+                    "content": "Eres un agente de soporte tecnico amigable y cercano que escribe mensajes por WhatsApp."
+                },{
+                    "role": "user",
+                    "content": (
+                        f"Redacta un mensaje corto por WhatsApp informando que el ticket fue resuelto "
+                        f"Sin saludos como 'Hola', ve directo al mensaje. "
+                        f"Usa el nombre completo del agente, no solo el primero. "
+                        f"Di que 'resolvió la incidencia', nunca 'logró solucionar'. "
+                        f"Sé natural, cálido y breve. Sin lenguaje corporativo.\n\n"
+                        f"Ticket: #{ticket_number}\n"
+                        f"Asunto: {ticket_title}\n"
+                        f"Atendido por: {agent_name}\n"
+                        f"Nota del técnico: {close_note or 'Sin nota adicional'}\n\n"
+                        f"Máximo 4 líneas, con 1 emoji al final."
+                        f"Intena que la nota adicional quede igual o muy parecida en el mensaje que crearas"
+                        f"No le digas que todo listo para trabajar, ni todo en orden  ni nada por el estilo, no termines asi"
+                        f"Ejeplo de como deberia sonar Tu ticket #91065 ha sido resuelto. Simon Restrepo Yepes atendió tu incidencia y solucionó el error RPC_E_SERVERFAULT (0x80010105) al iniciar sesión en la VM Ubuntu 18.04.3 en VirtualBox"
+                    )
+                }
+                             ]
+                
+            }
+        )
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        else:
+            return (
+                f"Tu ticket #{ticket_number} fue resuelto por {agent_name}."
+                f"Si tienes dudas, escribenos"
+            )

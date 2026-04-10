@@ -20,7 +20,7 @@ import models.notified_tickets
 async def lifespan(app: FastAPI):
     await init_llm_with_tools()
     asyncio.create_task(start_clean_periodic())
-    asyncio.create_task(start_zammad_polling(interval=60))  
+    asyncio.create_task(start_zammad_polling(interval=15))  
     yield
 
 
