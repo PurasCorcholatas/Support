@@ -464,13 +464,18 @@ async def escalate_human(state: State):
     thread_id = state.get("thread_id") or ""
     conv_id = state.get("chatwoot_conversation_id")
     
+    summary = state.get("summary", "")
     historial_lista = state.get("diagnosis_history") or []
+    
     if not historial_lista:
         mensajes_state = state.get("messages", [])
         historial_lista = [
             f"{'Usuario' if m.type == 'human' else 'Bot'}: {m.content}"
             for m in mensajes_state
         ][-8:]
+
+    if summary:
+        historial_lista = [f"Resumen previo: {summary}"] + historial_lista
 
     resumen_ejecutivo = await _generar_resumen_agente(historial_lista)
 

@@ -43,6 +43,10 @@ ESTILO:
 Haz preguntas de diagnóstico cuando haya un problema técnico.
 """
     messages_state = state.get("messages", [])
+    summary = state.get("summary", "")
+    
+    if summary:
+        system_prompt += f"\n\nRECUERDA (Resumen de lo hablado antes): {summary}"
 
     if not any(isinstance(m, SystemMessage) for m in messages_state):
         messages_state = [SystemMessage(content=system_prompt)] + messages_state

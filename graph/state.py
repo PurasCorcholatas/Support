@@ -8,6 +8,7 @@ class State(TypedDict, total=False):
     human_escalated: Optional[bool]
 
     messages: Annotated[List[BaseMessage], add_messages]
+    summary: Optional[str]
     intent: Literal[
         "chat_general",
         "crear_ticket",

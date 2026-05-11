@@ -6,6 +6,7 @@ from .nodes.quick_fix import quick_fix_flow
 from .nodes.support import offer_support_options, support_agent, check_ticket_status, escalate_human, waiting_agent
 from .nodes.chat import chat_general
 from .nodes.router import router
+from .nodes.summarizer import summarizer
 from .helpers import _normalize_images, guided_response, detect_intent_simple, _hacer_pregunta_tecnica, _parse_ticket_result, generate_ticket_summary, generate_technical_details, clean_html_entities
 from .integrations import (
     save_conversation_memory, user_has_email, get_user_email,
@@ -108,6 +109,7 @@ async def init_llm_with_tools():
 
     builder = StateGraph(State)
 
+    builder.add_node("summarizer", summarizer)
     builder.add_node("router", router)
     builder.add_node("chat_general", chat_general)
     builder.add_node("greeting_flow", greeting_flow)
@@ -120,7 +122,8 @@ async def init_llm_with_tools():
     builder.add_node("waiting_agent", waiting_agent)
     builder.add_node("tools", tool_node)
 
-    builder.add_edge(START, "router")
+    builder.add_edge(START, "summarizer")
+    builder.add_edge("summarizer", "router")
 
     builder.add_conditional_edges(
         "router",

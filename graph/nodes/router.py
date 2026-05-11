@@ -104,7 +104,9 @@ async def router(state: State):
         db.close()
 
     # 4. DETECCIÓN DE INTENCIÓN TÉCNICA
-    # Prioridad alta para no ignorar problemas directos
+    summary = state.get("summary", "")
+    router_context = f"Resumen de lo hablado anteriormente: {summary}" if summary else ""
+
     detected = detect_intent_simple(
         user_text,
         {
@@ -112,7 +114,8 @@ async def router(state: State):
             "crear_ticket": "tiene un problema, error, falla, necesita soporte o quiere migrar",
             "humano": "quiere hablar con un agente humano",
             "otro": "saludo o charla"
-        }
+        },
+        context=router_context
     )
 
     if "estado_ticket" in detected:

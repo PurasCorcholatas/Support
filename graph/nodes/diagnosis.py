@@ -122,10 +122,14 @@ Responde sin repetir lo que ya explicaste antes.
                     "messages": [AIMessage(content=str(clarification_response.content))]
                 }
 
+    summary = state.get("summary", "")
+    summary_context = f"\nResumen de la conversación anterior: {summary}\n" if summary else ""
+
     try:
         entities_response = llm_diagnosis.invoke([
             SystemMessage(content="Responde SOLO en JSON sin markdown ni explicaciones."),
             HumanMessage(content=f"""
+{summary_context}
 Del historial extrae las entidades ya conocidas sobre el problema:
 {{
     "alcance": "un usuario / varios usuarios / toda la empresa / null",
