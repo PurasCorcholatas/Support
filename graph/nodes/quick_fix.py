@@ -109,32 +109,27 @@ async def quick_fix_flow(state: State):
     finally:
         db.close()
 
+    summary = state.get("summary", "")
     response = llm_diagnosis.invoke([
         SystemMessage(content="""
 Eres un técnico de soporte senior de Serviunix.
 
 Tu trabajo es evaluar si el problema tiene UNA solución que el usuario puede ejecutar solo.
 
-Puedes resolver (can_fix: true) si el problema se soluciona con pasos simples 
-que el usuario puede ejecutar sin conocimientos técnicos y sin que un técnico 
-acceda a su equipo remotamente.
+IMPORTANTE: Revisa el historial de la conversación. Si el bot ya sugirió una solución rápida (por ejemplo, durante el análisis de una imagen) y el usuario indicó que no funcionó, NO la repitas. Proporciona una solución más avanzada o determina que no puedes resolverlo (can_fix: false) para escalar el caso.
 
-PUEDES resolver:
+PUEDES resolver (can_fix: true) si el problema se soluciona con pasos simples:
 - Borrar caché, cookies, modo incógnito
 - Reiniciar equipo, aplicación o servicio simple
-- Reconectar impresora, mouse, teclado, unidad de red
-- Liberar/renovar IP o flush DNS (con comandos simples)
-- Cerrar procesos desde administrador de tareas
-- Verificar configuración básica (fecha/hora, spam, permisos de carpeta)
-- Reparar perfil de Outlook o reconectar cuenta de correo básica
+- Reconectar periféricos o unidades de red
+- Comandos simples de red (flush DNS, ipconfig)
+- Reparar perfiles básicos o configuraciones de software
 
 NO PUEDES resolver (can_fix: false):
-- Problemas de servidor, VPN o red corporativa completa
-- Configuración avanzada de dominio o Active Directory
-- Errores de ERP o aplicaciones empresariales complejas
-- Migraciones o instalaciones de software nuevo
-- Problemas que requieren acceso remoto al equipo
-- Varios usuarios afectados al mismo tiempo
+- Problemas de infraestructura corporativa (VPN, Servidores, AD)
+- Errores complejos de ERP o aplicaciones empresariales
+- Tareas que requieren acceso remoto obligatorio
+- Cuando las soluciones simples ya fallaron previamente
 
 Responde SOLO en JSON sin markdown:
 {
@@ -143,13 +138,15 @@ Responde SOLO en JSON sin markdown:
   "pasos": ["paso 1", "paso 2", "paso 3"],
   "solucion_resumen": "ej: borrar caché de Chrome"
 }
-Los campos pasos y solucion_resumen solo van si can_fix es true. Máximo 3 pasos simples.
 """),
         HumanMessage(content=f"""
-Historial del problema:
+Resumen de la conversación previa:
+{summary if summary else "No hay resumen previo aún."}
+
+Historial reciente del problema:
 {history_text}
 
-Memoria de problemas anteriores de este usuario:
+Memoria histórica del usuario:
 {memory_context if memory_context else "Sin historial previo"}
 """)
     ])
