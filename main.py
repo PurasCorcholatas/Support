@@ -1,25 +1,31 @@
-import asyncio
 import sys
-from contextlib import asynccontextmanager
+import asyncio
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI
 from router.router import user, chat, whatssap_router, router
-from graph.graph import init_llm_with_tools
-from services.cleanup import start_clean_periodic
+from graph.main import init_llm_with_tools
+from services.cleanup import cleaner_bot_messages_loop
 from services.zammad_services import start_zammad_polling
 import models.notified_tickets 
+import models.bot_messages
+from config.db import meta_data, engine
+
+meta_data.create_all(engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_llm_with_tools()
-    asyncio.create_task(start_clean_periodic())
+    asyncio.create_task(cleaner_bot_messages_loop())
     asyncio.create_task(start_zammad_polling(interval=15))  
     yield
 

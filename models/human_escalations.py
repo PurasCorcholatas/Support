@@ -19,6 +19,6 @@ human_escalations = Table(
     extend_existing=True
 )
 
-meta_data.create_all(engine)
+
 
 

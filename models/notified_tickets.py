@@ -15,5 +15,4 @@ notified_tickets = Table(
     Column("notified_at", DateTime, default=datetime.utcnow)
 )
 
-
-meta_data.create_all(engine)
+

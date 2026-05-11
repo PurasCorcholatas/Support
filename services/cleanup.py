@@ -24,69 +24,19 @@ LIMPIAR_CAMPOS = [
 ]
 
 
-async def cleaner_conversation():
-    """
-    Limpia el estado de conversaciones inactivas en LangGraph.
-    Busca checkpoints que no han tenido actividad en las últimas
-    INACTIVIDAD_HORAS horas y elimina sus datos de estado.
-    """
-    try:
-        db = SessionLocal()
-        limite = datetime.now(timezone.utc) - timedelta(hours=INACTIVIDAD_HORAS)
-
-        resultado = db.execute(text("""
-            DELETE FROM checkpoint_writes
-            WHERE thread_id IN (
-                SELECT DISTINCT thread_id
-                FROM checkpoints
-                WHERE updated_at < :limite
-            )
-        """), {"limite": limite})
-
-        writes_eliminados = getattr(resultado, 'rowcount', 0)
-
-        resultado2 = db.execute(text("""
-            DELETE FROM checkpoint_blobs
-            WHERE thread_id IN (
-                SELECT DISTINCT thread_id
-                FROM checkpoints
-                WHERE updated_at < :limite
-            )
-        """), {"limite": limite})
-
-        blobs_eliminados = getattr(resultado2, 'rowcount', 0)
-
-        resultado3 = db.execute(text("""
-            DELETE FROM checkpoints
-            WHERE updated_at < :limite
-        """), {"limite": limite})
-
-        checkpoints_eliminados = getattr(resultado3, 'rowcount', 0)
-
-        db.commit()
-        db.close()
-
-        logger.info(
-            "Limpieza completada — checkpoints: %s, blobs: %s, writes: %s",
-            checkpoints_eliminados,
-            blobs_eliminados,
-            writes_eliminados,
-        )
-
-    except Exception:
-        logger.exception("Error en limpieza de conversaciones huérfanas")
-
-
-async def start_clean_periodic():
-    """
-    Loop que corre indefinidamente y ejecuta la limpieza
-    cada INACTIVIDAD_HORAS horas.
-    """
-    print(f"Limpieza periódica iniciada — intervalo: {INACTIVIDAD_HORAS} horas")
-    logger.info(
-        "Limpieza periódica iniciada — intervalo: %s horas",
-        INACTIVIDAD_HORAS
-    )
+async def cleaner_bot_messages_loop():
+    """Limpia los mensajes del bot de la base de datos cada 5 minutos."""
+    logger.info("Limpieza de bot_messages iniciada — intervalo: 5 minutos")
     while True:
-        await asyncio.sleep(INACTIVIDAD_HORAS * 3600)
-        await cleaner_conversation()
+        try:
+            db = SessionLocal()
+            limite = datetime.now(timezone.utc) - timedelta(minutes=5)
+            resultado = db.execute(text("DELETE FROM bot_messages WHERE created_at < :limite"), {"limite": limite})
+            db.commit()
+            db.close()
+            eliminados = getattr(resultado, 'rowcount', 0)
+            if eliminados > 0:
+                logger.info("Limpieza bot_messages: %s eliminados", eliminados)
+        except Exception:
+            logger.exception("Error en limpieza de bot_messages")
+        await asyncio.sleep(300)
