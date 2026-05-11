@@ -16,6 +16,7 @@ import aiosmtplib
 from email.mime.text import MIMEText
 from services.mcp_client import get_mcp_tools
 from config.logger import logger
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..state import State
 from ..llms import llm, llm_diagnosis, tools
@@ -238,31 +239,40 @@ async def support_agent(state: State):
             firstname = name_parts[0] if name_parts else "Usuario"
             lastname = name_parts[1] if len(name_parts) > 1 else "Cliente"
             
-            
             if not customer:
                 customer = f"{thread_id}@whatsapp.noreply"
                 print(f"[support_agent] Sin email, usando fallback: {customer}")
             
-            await create_user_tool.ainvoke({
-                "params": {
-                    "email": customer,
-                    "firstname": firstname,
-                    "lastname": lastname,
-                }
-            })
+            # Usamos una función interna con retry para asegurar el usuario
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+            async def ensure_user():
+                await create_user_tool.ainvoke({
+                    "params": {
+                        "email": customer,
+                        "firstname": firstname,
+                        "lastname": lastname,
+                    }
+                })
+            
+            await ensure_user()
             print(f"Usuario asegurado en Zammad: {customer}")
         except Exception as e:
-            print(f"[support_agent] Usuario ya existe o error al crear en Zammad: {e}")
+            print(f"[support_agent] Error persistente con usuario en Zammad: {e}")
 
-    result = await create_tool.ainvoke({
-        "params": {
-            "title": title,
-            "group": "Users",
-            "customer": customer if customer else "soporte@soporteAI.com",
-            "article_body": user_info,
-            "priority": PRIORIDAD_MAP.get(severity, "2 moderada"),
-        }
-    })
+    # Función interna con retry para la creación del ticket
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+    async def create_ticket_with_retry():
+        return await create_tool.ainvoke({
+            "params": {
+                "title": title,
+                "group": "Users",
+                "customer": customer if customer else "soporte@soporteAI.com",
+                "article_body": user_info,
+                "priority": PRIORIDAD_MAP.get(severity, "2 moderada"),
+            }
+        })
+
+    result = await create_ticket_with_retry()
 
     print("Resultado create_ticket", result)
 
@@ -538,6 +548,11 @@ async def _generar_resumen_agente(history: list) -> Optional[str]:
         logger.error(f"Error generando resumen: {e}")
         return None
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
 async def _enviar_nota_privada_chatwoot(conv_id: int, mensaje: str):
     chatwoot_url = os.getenv("CHATWOOT_URL")
     account_id = os.getenv("CHATWOOT_ACCOUNT_ID")

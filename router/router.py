@@ -25,6 +25,7 @@ import asyncio
 import json
 import hmac
 import hashlib
+from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_openai import ChatOpenAI
 
 from typing import Optional
@@ -138,6 +139,11 @@ async def deactivate_bot_for_agent(phone_number:str):
 
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
 async def analyze_image_from_url(image_url: str) -> Optional[str]:
     try:
         
@@ -187,6 +193,11 @@ Si no es una imagen de problema técnico, describe brevemente qué muestra."""
         return None
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
 async def download_image_as_base64(image_url: str) -> dict | None:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
@@ -204,6 +215,11 @@ async def download_image_as_base64(image_url: str) -> dict | None:
         logger.error(f"Error descargando imagen: {e}")
         return None
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
 async def analyze_audio_from_url(audio_url:str) -> Optional[str]:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
@@ -246,6 +262,11 @@ async def analyze_audio_from_url(audio_url:str) -> Optional[str]:
 
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True
+)
 async def analyze_video_from_url(video_url: str) -> tuple[Optional[str], list[str]]:
     """
     Descarga un video, extrae fotogramas clave y los analiza usando GPT-4o.

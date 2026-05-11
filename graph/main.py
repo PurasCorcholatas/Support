@@ -351,8 +351,5 @@ async def langgraph(mensaje: str, thread_id: str, image_b64_list: list = None, c
         finally:
             db.close()
 
-    async with _locks_meta:
-        _locks.pop(thread_id, None)
-
     return result_to_return
 

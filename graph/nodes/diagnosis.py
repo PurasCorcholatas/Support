@@ -40,9 +40,12 @@ async def diagnosis_flow(state: State):
     if isinstance(last_msg_obj.content, list):
         image_context = llm_diagnosis.invoke([
             SystemMessage(content=(
-                "Eres un técnico de soporte. Describe en texto plano el error que ves en la imagen. "
-                "Incluye: aplicación, código de error, mensaje exacto, sistema operativo o VM afectada, "
-                "y cualquier otro detalle visible. Máximo 4 oraciones."
+                "Eres un ingeniero senior de soporte técnico en Serviunix. Tu tarea es analizar esta imagen de error. "
+                "1. Identifica el sistema o aplicación afectada. "
+                "2. Extrae CÓDIGOS DE ERROR exactos y el mensaje de texto visible. "
+                "3. Basado en tu conocimiento técnico, explica brevemente qué significa ese error. "
+                "4. Sugiere UN paso de solución inmediata que el usuario pueda intentar. "
+                "Responde en un tono técnico pero claro para WhatsApp. Máximo 5 oraciones."
             )),
             last_msg_obj
         ])
@@ -258,9 +261,14 @@ Devuelve SOLO la siguiente pregunta técnica. Una oración. Sin nada más.
 
     question = str(getattr(response, "content", response)).strip()
 
+    final_content = question
+    if 'image_context' in locals() and image_context:
+        analysis = str(image_context.content).strip()
+        final_content = f"Mira, analicé la imagen:\n\n{analysis}\n\n{question}"
+
     return {
         "diagnosis_step": step + 1,
         "diagnosis_history": updated_history + [f"bot: {question}"],
         "diagnosis_images": state.get("diagnosis_images") or [],
-        "messages": [AIMessage(content=question)]
+        "messages": [AIMessage(content=final_content)]
     }
