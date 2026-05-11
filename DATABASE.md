@@ -7,7 +7,7 @@ Este documento detalla la arquitectura de persistencia de datos del sistema de s
 
 ```mermaid
 erDiagram
-    USERS ||--o{ CONVERSATION : has
+    USERS ||--o{ CONVERSATION : has}
     USERS {
         int id PK
         bigint phone_number
